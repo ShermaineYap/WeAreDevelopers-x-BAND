@@ -1,5 +1,5 @@
 Harness: Claude Code
-Model: claude-opus-5[1m]
+Model: claude-opus-5-5[1m]
 
 # auditor
 
