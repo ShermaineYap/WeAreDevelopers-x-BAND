@@ -68,7 +68,11 @@ async function runSearch(query, { refresh = false } = {}) {
     results.replaceChildren(el('div', { class: 'loading', role: 'status' },
       el('span', { class: 'loading__dot', 'aria-hidden': 'true' }), 'Checking tables…'));
   }
-  const params = new URLSearchParams({ restaurant_id: query.restaurantId, date: query.date, party_size: String(query.party) });
+  // explain=true lets the server say why each table is unavailable, under the policy that
+  // applies to the date (capacities can differ from the restaurant's fixture).
+  const params = new URLSearchParams({
+    restaurant_id: query.restaurantId, date: query.date, party_size: String(query.party), explain: 'true',
+  });
   let availability;
   let restaurant;
   try {
@@ -113,6 +117,7 @@ function refreshGrid() {
 
 const CAUSE_TEXT = { available: 'Available', booked: 'Booked', small: 'Too small' };
 
+/** A cell; `capacity` is shown when the server reported it (available seatings). */
 function cell({ restaurant, tableIds, startsAtLocal, capacity, cause }) {
   const time = startsAtLocal.slice(11, 16);
   const name = seatingName(restaurant, tableIds);
@@ -127,11 +132,11 @@ function cell({ restaurant, tableIds, startsAtLocal, capacity, cause }) {
     'data-available': String(available),
     'aria-disabled': available ? false : 'true',
     'aria-pressed': available ? String(selected) : false,
-    'aria-label': `${name}, ${combined ? 'tables together, ' : ''}seats ${capacity}, ${time}: ${CAUSE_TEXT[cause].toLowerCase()}`,
+    'aria-label': `${name}, ${combined ? 'tables together, ' : ''}${capacity ? `seats ${capacity}, ` : ''}${time}: ${CAUSE_TEXT[cause].toLowerCase()}`,
     onclick: () => { if (available) choose(tableIds, startsAtLocal); },
   },
   el('span', { class: 'cell__name' }, name),
-  el('span', { class: 'cell__meta' }, `${combined ? 'Together · ' : ''}Seats ${capacity}`),
+  capacity ? el('span', { class: 'cell__meta' }, `${combined ? 'Together · ' : ''}Seats ${capacity}`) : null,
   el('span', { class: 'cell__state' }, selected ? 'Selected' : CAUSE_TEXT[cause]));
 }
 
@@ -150,19 +155,21 @@ function renderGrid() {
     renderPanel();
     return;
   }
-  const capacityOf = (id) => restaurant.tables.find((t) => t.id === id).capacity;
   const rows = availability.slots.map((slot) => {
+    const optionFor = (ids) => slot.available_options.find((o) => o.table_ids.join('+') === ids.join('+'));
     const singles = restaurant.tables.map((table) => {
-      const available = slot.available_table_ids.includes(table.id);
-      const cause = available ? 'available' : table.capacity < query.party ? 'small' : 'booked';
-      return cell({ restaurant, tableIds: [table.id], startsAtLocal: slot.starts_at_local, capacity: table.capacity, cause });
+      const option = optionFor([table.id]);
+      const reason = (slot.explain || []).find((e) => e.table_id === table.id);
+      const tooSmall = reason ? !reason.rules[0].holds : false;
+      const cause = slot.available_table_ids.includes(table.id) ? 'available' : tooSmall ? 'small' : 'booked';
+      return cell({ restaurant, tableIds: [table.id], startsAtLocal: slot.starts_at_local, capacity: option && option.capacity, cause });
     });
     // Combined seatings appear only when the declared pair is free for this party.
     const pairs = (restaurant.combinable || [])
-      .filter((pair) => slot.available_options.some((o) => o.table_ids.join('+') === pair.join('+')))
-      .map((pair) => cell({
-        restaurant, tableIds: pair, startsAtLocal: slot.starts_at_local,
-        capacity: capacityOf(pair[0]) + capacityOf(pair[1]), cause: 'available',
+      .map((pair) => optionFor(pair))
+      .filter(Boolean)
+      .map((option) => cell({
+        restaurant, tableIds: option.table_ids, startsAtLocal: slot.starts_at_local, capacity: option.capacity, cause: 'available',
       }));
     return el('li', { class: 'slot' },
       el('p', { class: 'slot__time' }, slot.starts_at_local.slice(11, 16)),
@@ -197,7 +204,7 @@ function choose(tableIds, startsAtLocal) {
   state.selection = { tableIds, startsAtLocal, restaurant: state.shown.restaurant, party: state.shown.query.party };
   renderGrid();
   renderBookingForm();
-  panel.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  panel.scrollIntoView({ block: 'nearest' }); // instant: the form is ready the moment it shows
 }
 
 function renderPanel() {
@@ -232,7 +239,7 @@ function renderBookingForm() {
 }
 
 const REFUSALS = {
-  table_unavailable: 'Someone has just booked this table for that time. Choose another table or time — your details are kept.',
+  table_unavailable: 'This table is no longer free at that time. Choose another table or time — your details are kept.',
   party_exceeds_capacity: 'That is more guests than this seating holds. Choose a larger table or a combined seating.',
 };
 

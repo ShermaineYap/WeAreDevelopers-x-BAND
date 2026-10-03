@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Tablekeeper stage 2. Multi-stage: dependencies and TypeScript are resolved at build time
+# Tablekeeper stage 3. Multi-stage: dependencies and TypeScript are resolved at build time
 # (network available); the runtime image needs no network.
 
 # Production dependencies, with native modules (better-sqlite3, bcrypt) built for Alpine/musl.

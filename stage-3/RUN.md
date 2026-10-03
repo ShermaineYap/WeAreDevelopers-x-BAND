@@ -1,7 +1,9 @@
-# Tablekeeper — stage 2
+# Tablekeeper — stage 3
 
 HTTP API plus browser screens for restaurant availability, bookings (single tables and
-declared combinable pairs), cancellations, amendments and atomic multi-booking moves.
+declared combinable pairs), cancellations, amendments and atomic multi-booking moves; dated
+booking policies with accepted terms and revisions, availability explanations, reservation
+history and recurring reservations (series).
 Node 22 + TypeScript, Express, an in-memory `better-sqlite3` store, `luxon` for time zones
 and `bcrypt` for password hashing. State is ephemeral.
 
@@ -11,11 +13,11 @@ all served from the image (`/assets/...`); pages make no requests outside the se
 
 ## Build and run
 
-From this folder (`stage-2/`):
+From this folder (`stage-3/`):
 
 ```sh
-docker build -t tablekeeper-stage-2 .
-docker run --rm -p 8080:8080 -e PORT=8080 tablekeeper-stage-2
+docker build -t tablekeeper-stage-3 .
+docker run --rm -p 8080:8080 -e PORT=8080 tablekeeper-stage-3
 ```
 
 Open http://localhost:8080/ in a browser.
@@ -29,12 +31,13 @@ The service listens on `0.0.0.0:$PORT` (default `8080`) and needs no network at 
 With the service running on port 8080, from the repository root:
 
 ```sh
-# API (stage-1 regression + stage-2)
-BASE_URL=http://localhost:8080 node --test --test-concurrency=1 stage-2/tests/acceptance/*.test.mjs
-# Browser (one-time: npm --prefix stage-2/tests/acceptance ci)
-BASE_URL=http://localhost:8080 node --test --test-concurrency=1 stage-2/tests/acceptance/browser/*.test.mjs
-# Upgrade from a stage-1 export: run the stage-1 image on 8081 and add
-#   PREVIOUS_BASE_URL=http://localhost:8081 to the API command.
+# API (stage-1 and stage-2 regression + stage-3)
+BASE_URL=http://localhost:8080 node --test --test-concurrency=1 stage-3/tests/acceptance/*.test.mjs
+# Browser (one-time: npm --prefix stage-3/tests/acceptance ci)
+BASE_URL=http://localhost:8080 node --test --test-concurrency=1 stage-3/tests/acceptance/browser/*.test.mjs
+# Upgrades: run the stage-2 image on 8081 and the stage-1 image on 8082, and add
+#   PREVIOUS_BASE_URL=http://localhost:8081 PREVIOUS_STAGE1_BASE_URL=http://localhost:8082
+# to the API command.
 ```
 
 ## Layout
@@ -56,6 +59,10 @@ BASE_URL=http://localhost:8080 node --test --test-concurrency=1 stage-2/tests/ac
 | `src/time.ts` | Local date/time parsing and IANA zone resolution (gap → none, overlap → first) |
 | `src/state.ts` | Whole-state records: replace (reset/import), snapshot (export), import validation |
 | `src/fixture.ts` | Reset fixture validation and seeding |
+| `src/terms.ts`, `src/hours.ts` | Booking rules: policy 0, accepted terms, policy and opening-hours validation |
+| `src/policies.ts` | Policy publication, the public list, and policy selection by local start date |
+| `src/history.ts` | Reservation history entries and change computation |
+| `src/series.ts` | Recurring reservations: adoption and reads |
 | `src/fields.ts` | Request field reading: wrong type 400, missing/invalid 422, table sets |
 | `src/db.ts` | SQLite schema and the transaction helper |
 
@@ -86,8 +93,28 @@ BASE_URL=http://localhost:8080 node --test --test-concurrency=1 stage-2/tests/ac
 - Seeds may carry `table_id` or `table_ids` and `status` (`confirmed` default, or `cancelled`);
   only confirmed seeds must not overlap.
 - Signup `display_name` is optional; without one the account is named after the email's local part.
-- Every write (create, cancel, amend, moves, signup, login, reset, import) runs in one
-  synchronous SQLite transaction.
+- Every write (create, cancel, amend, moves, policy publication, series adoption, signup,
+  login, reset, import) runs in one synchronous SQLite transaction.
+- Stage 3 order of checks for PATCH and each move item: not yours (404), invalid
+  `expected_revision` (422), stale `expected_revision` (409 `stale_revision`), cancelled (409),
+  the old accepted cutoff (409), field types and values, then no-op detection (resulting values
+  equal the current ones, a reversed declared pair included), then the resulting fields under
+  the policy for the resulting start date, then occupancy. A no-op returns the booking
+  unchanged and records nothing.
+- Policy publication: auth (401), body, key (400/422), idempotency, unknown restaurant (404),
+  non-manager (403), then validation (422, every invalid value). Versions count per restaurant
+  and are allocated only on success. `GET /restaurants/{id}` keeps returning the fixture.
+- Series: field validation (422), anchor not yours (404), cancelled (409), already in a series
+  (409 `already_in_series`), past the accepted cutoff (409), then each generated occurrence in
+  index order with full booking validation and occupancy; the first failure decides.
+- History, decision and `GET /series/{id}` answer 404 to anyone but the owner, including
+  callers without a token. History `at` is UTC (`+00:00`) at second precision.
+- Restaurant revision (not readable until stage 4) counts each successful booking, real
+  amendment, cancellation, policy publication, series adoption and changing move batch.
+- Bookings seeded by a fixture or imported from stage-1/stage-2 exports get revision 1, policy-0
+  terms and a synthesised `created` (and `cancelled`) history entry at their creation time.
+- UI: the grid asks for `explain=true`, so a table that cannot fit the party under the date's
+  policy is labelled "Too small" and seat counts come from the server's options.
 - UI: the session token is kept in `localStorage`; a booking's retry identity (body and
   Idempotency-Key) is kept in the page, so an unchanged resubmit or a retry after a lost
   response reuses the key, and any change to the form uses a new one. Only the latest search
