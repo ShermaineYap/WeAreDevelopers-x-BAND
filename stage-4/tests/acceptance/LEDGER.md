@@ -113,6 +113,7 @@
 | S4-046 | Non-occupancy errors in index order precede occupancy; failure changes nothing, and the key stays reusable | not covered | series-amend: S4-046 |
 | S4-047 | Results must not conflict with unchanged occurrences, other bookings or applied closures | not covered | series-amend: S4-047 |
 | S4-048 | Concurrent amendments from one expected revision: at most one real change | not covered | series-amend: S4-048 |
+| S4-049 | Only **real** changes check the old accepted cutoff: an unchanged eligible occurrence past its cutoff neither blocks the amendment nor fails an all-no-op ("Each real change checks its old accepted cutoff"; "All-no-op … succeed") | not covered | series-amend: S4-049 (slow, ~1-2 min) |
 | S4-050 | Stage-3 exports are accepted: series (with moved and cancelled occurrences), histories, policies and receipts stay valid; series amend and repairs work on them | not covered | upgrade4: S4-050 (`PREVIOUS_BASE_URL`) |
 | S4-051 | Stage-1 and stage-2 exports are accepted; receipts stay valid; imported bookings can be adopted and series-amended | not covered | upgrade4: S4-051 (`PREVIOUS_STAGE2_BASE_URL`, `PREVIOUS_STAGE1_BASE_URL`) |
 | S4-060 | Availability screens reflect an applied plan: closure cells unavailable and labelled "closed", distinct in text and style from booked and available (brief, L-8) | not covered | browser/closure-ui: S4-060 |
@@ -135,6 +136,6 @@
 ## Not exercised by the supplied checks
 
 **Not covered:** S4-002, 004, 005, 006, 007, 009, 010, 011, 012, 013, 014, 020, 021, 022, 023, 024, 025,
-026, 027, 028, 029, 030, 031, 041, 043, 044, 045, 046, 047, 048, 050, 051, 060, 061.
+026, 027, 028, 029, 030, 031, 041, 043, 044, 045, 046, 047, 048, 049, 050, 051, 060, 061.
 
 **Partial:** S4-001, 003, 008, 040, 042.

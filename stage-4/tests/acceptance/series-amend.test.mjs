@@ -172,3 +172,36 @@ test('S4-048 concurrent amendments from one revision: exactly one real change', 
   assert.equal(g.revision, 2);
   assert.equal(new Set(g.occurrences.map(o => o.reservation.starts_at_local.slice(11))).size, 1);
 });
+
+test('S4-049 only real changes check the cutoff: an unchanged occurrence past its cutoff does not block (slow: ~1-2 min)', async () => {
+  // A policy whose cutoff ends a minute or two after adoption makes occurrence 0 pass its cutoff during the test.
+  const { todayIn, mustBookP, amend } = await import('./lib4.mjs');
+  const t = await world4();
+  const tomorrow = addDays(todayIn('UTC'), 1);
+  const start = Date.parse(`${tomorrow}T12:00:00Z`);
+  const c = Math.floor((start - Date.now()) / 60000) - 1;
+  await mustPublish(t.max, { effective_from: '2020-01-01', slot_minutes: 30, reservation_duration_minutes: 60, cancellation_cutoff_minutes: c, opening_hours: allWeek('00:00', '23:30'), capacities: { t_s1: 4, t_s2: 4 } }, { rid: 'r_soon' });
+  const mk = async (table) => {
+    const a = await mustBookP(t.ada, { restaurant_id: 'r_soon', table_id: table, starts_at_local: `${tomorrow}T12:00` });
+    const r = await adopt(t.ada, { anchor_reference: a.reference, count: 2, interval_weeks: 1 });
+    assertStatus(r, 201);
+    return r.body;
+  };
+  const mixed = await mk('t_s1');
+  const same = await mk('t_s2');
+  assertStatus(await amendSeries(t.ada, mixed.series_id, { expected_revision: 1, from_index: 1, local_time: '13:00' }), 201);
+  await new Promise(r => setTimeout(r, Math.max(0, start - c * 60000 - Date.now() + 3000)));
+  assertError(await amend(mixed.occurrences[0].reference, { party_size: 3 }, t.ada), 409, 'cutoff_passed');   // sanity: past cutoff now
+  // All-no-op: succeeds without changing any revision.
+  const noop = await amendSeries(t.ada, same.series_id, { expected_revision: 1, from_index: 0, local_time: '12:00' });
+  assertStatus(noop, 201);
+  assert.equal(noop.body.revision, 1);
+  // Occurrence 0 unchanged (no cutoff check), occurrence 1 a real change.
+  const r = await amendSeries(t.ada, mixed.series_id, { expected_revision: 2, from_index: 0, local_time: '12:00' });
+  assertStatus(r, 201);
+  assert.equal(r.body.revision, 3);
+  assert.deepEqual(r.body.occurrences.map(o => o.reservation.starts_at_local.slice(11)), ['12:00', '12:00']);
+  assert.equal(r.body.occurrences[0].reservation.revision, 1);
+  // A real change to occurrence 0 is still refused by its cutoff.
+  assertError(await amendSeries(t.ada, same.series_id, { expected_revision: 1, from_index: 0, local_time: '13:00' }), 409, 'cutoff_passed');
+});
