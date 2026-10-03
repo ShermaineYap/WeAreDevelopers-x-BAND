@@ -1,0 +1,12 @@
+{
+  "name": "tablekeeper-stage-2-acceptance",
+  "private": true,
+  "description": "Auditor acceptance tests (black-box HTTP + headless Chromium). API suites need no dependencies.",
+  "scripts": {
+    "test:api": "node --test --test-concurrency=1 *.test.mjs",
+    "test:browser": "node --test --test-concurrency=1 browser/*.test.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "1.63.0"
+  }
+}
