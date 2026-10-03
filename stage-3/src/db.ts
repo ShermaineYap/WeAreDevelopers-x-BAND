@@ -27,7 +27,9 @@ db.exec(`
     reservation_duration_minutes INTEGER NOT NULL,
     cancellation_cutoff_minutes  INTEGER NOT NULL,
     opening_hours                TEXT NOT NULL,
-    combinable                   TEXT NOT NULL
+    combinable                   TEXT NOT NULL,
+    manager_user_ids             TEXT NOT NULL,
+    revision                     INTEGER NOT NULL DEFAULT 0
   );
   CREATE TABLE restaurant_tables (
     restaurant_id TEXT NOT NULL,
@@ -50,10 +52,44 @@ db.exec(`
     ends_at         TEXT NOT NULL,
     start_ms        INTEGER NOT NULL,
     end_ms          INTEGER NOT NULL,
-    created_at      TEXT NOT NULL
+    created_at      TEXT NOT NULL,
+    revision        INTEGER NOT NULL,
+    accepted_terms  TEXT NOT NULL,
+    series_id       TEXT,
+    series_index    INTEGER,
+    exception       INTEGER NOT NULL DEFAULT 0
   );
+  CREATE INDEX reservations_by_series ON reservations (series_id, series_index);
   CREATE INDEX reservations_by_time ON reservations (restaurant_id, status, start_ms);
   CREATE INDEX reservations_by_user ON reservations (user_id);
+  CREATE TABLE policies (
+    restaurant_id                TEXT NOT NULL,
+    policy_version               INTEGER NOT NULL,
+    effective_from               TEXT NOT NULL,
+    slot_minutes                 INTEGER NOT NULL,
+    reservation_duration_minutes INTEGER NOT NULL,
+    cancellation_cutoff_minutes  INTEGER NOT NULL,
+    opening_hours                TEXT NOT NULL,
+    capacities                   TEXT NOT NULL,
+    PRIMARY KEY (restaurant_id, policy_version)
+  );
+  CREATE TABLE history (
+    reservation_id TEXT NOT NULL,
+    seq            INTEGER NOT NULL,
+    at             TEXT NOT NULL,
+    event          TEXT NOT NULL,
+    changes        TEXT NOT NULL,
+    revision       INTEGER NOT NULL,
+    accepted_terms TEXT NOT NULL,
+    PRIMARY KEY (reservation_id, seq)
+  );
+  CREATE TABLE series (
+    id             TEXT PRIMARY KEY,
+    user_id        TEXT NOT NULL,
+    restaurant_id  TEXT NOT NULL,
+    interval_weeks INTEGER NOT NULL,
+    revision       INTEGER NOT NULL
+  );
   CREATE TABLE idempotency (
     user_id      TEXT NOT NULL,
     path         TEXT NOT NULL,

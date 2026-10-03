@@ -33,11 +33,13 @@ export const EXPORT_TRACK = 'tablekeeper';
 export const EXPORT_FORMAT_VERSION = 1;
 /**
  * Marker inside the opaque `state` so foreign objects are recognised as invalid.
- * Stage 1 wrote LEGACY_STATE_SCHEMA (single `table_id` per reservation, no `combinable`);
- * imports of that format are upgraded on the way in.
+ * Earlier stages wrote the older schemas; imports of those are upgraded on the way in:
+ * stage 1 had one `table_id` per reservation and no `combinable`; stages 1 and 2 had no
+ * policies, revisions, history or series.
  */
-export const STATE_SCHEMA = 'tablekeeper-store/2';
-export const LEGACY_STATE_SCHEMA = 'tablekeeper-store/1';
+export const STATE_SCHEMA = 'tablekeeper-store/3';
+export const STAGE1_STATE_SCHEMA = 'tablekeeper-store/1';
+export const STAGE2_STATE_SCHEMA = 'tablekeeper-store/2';
 
 /** Stage 2: a combination is a declared pair, never three or more tables. */
 export const MAX_TABLES_PER_BOOKING = 2;
@@ -49,6 +51,22 @@ export const MINUTES_PER_DAY = 24 * 60;
 export const MS_PER_MINUTE = 60_000;
 export const MS_PER_DAY = MINUTES_PER_DAY * MS_PER_MINUTE;
 
-/** The two write paths that take an Idempotency-Key (§7). Records are scoped per path. */
+/** Write paths that take an Idempotency-Key (§7). Records are scoped per path. */
 export const PATH_RESERVATIONS = '/reservations';
 export const PATH_MOVES = '/reservation-moves';
+export const PATH_SERIES = '/series';
+export const policiesPath = (restaurantId: string) => `/restaurants/${restaurantId}/policies`;
+
+/** Stage 3 policy ranges. */
+export const POLICY_MINUTES_MIN = 1;
+export const POLICY_MINUTES_MAX = 1440;
+export const POLICY_CUTOFF_MAX = 10080;
+export const POLICY_CAPACITY_MIN = 1;
+export const POLICY_CAPACITY_MAX = 100;
+
+/** Stage 3 recurring reservations: occurrences including the anchor, and their spacing. */
+export const SERIES_COUNT_MIN = 2;
+export const SERIES_COUNT_MAX = 12;
+export const SERIES_INTERVAL_WEEKS_MIN = 1;
+export const SERIES_INTERVAL_WEEKS_MAX = 4;
+export const DAYS_PER_WEEK = 7;

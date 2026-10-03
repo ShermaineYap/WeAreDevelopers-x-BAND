@@ -8,9 +8,10 @@ import {
   type JsonObject,
 } from './shape';
 import {
-  RESERVATION_STATUSES, declaredPair, emailKey, parseRestaurant, type Restaurant, type ReservationRow,
+  RESERVATION_STATUSES, declaredPair, emailKey, initialHistory, parseRestaurant, type Restaurant, type ReservationRow,
   type ReservationStatus, type StoreState,
 } from './state';
+import { policyZero } from './terms';
 import { formatInstant, formatLocalDateTime, formatUtcNow, parseLocalDateTime, resolveLocal } from './time';
 
 interface SeedUser {
@@ -72,6 +73,11 @@ function parseSeed(
     start_ms: startMs,
     end_ms: endMs,
     created_at: createdAt,
+    revision: 1,
+    accepted_terms: policyZero(restaurant),
+    series_id: null,
+    series_index: null,
+    exception: false,
   };
 }
 
@@ -124,7 +130,11 @@ export async function stateFromFixture(value: unknown): Promise<StoreState> {
     users: users.map((u, i) => ({ id: u.id, email: u.email, password_hash: hashes[i], display_name: u.display_name })),
     tokens: [],
     restaurants,
+    restaurant_revisions: {},
+    policies: [],
     reservations,
+    history: reservations.flatMap(initialHistory),
+    series: [],
     idempotency: [],
   };
 }

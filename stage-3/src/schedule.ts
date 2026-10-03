@@ -1,7 +1,10 @@
-// A restaurant's slot grid, opening hours, occupancy intervals and cutoff (§4, §8, §9).
+// Slot grid, opening hours, occupancy intervals and cutoff (§4, §8, §9). Every rule here
+// is read from the terms that apply (stage 3): policy 0 is the fixture's configuration.
 import { MS_PER_MINUTE } from './constants';
 import { unprocessable, validationFailed } from './errors';
-import type { OpeningHours, Restaurant } from './state';
+import type { OpeningHours } from './hours';
+import type { Restaurant } from './state';
+import type { Terms } from './terms';
 import {
   atMinute, formatInstant, formatLocalDateTime, minuteOfDay, parseClock, parseLocalDateTime,
   resolveLocal, resolveLocalLenient, weekdayOf, type LocalDate, type LocalDateTime,
@@ -36,11 +39,14 @@ export interface SeatingOption {
   capacity: number;
 }
 
-/** Every seating the restaurant offers: singles in fixture order, then pairs in `combinable` order. */
-export function seatingOptions(restaurant: Restaurant): SeatingOption[] {
-  const capacity = (id: string) => restaurant.tables.find((t) => t.id === id)!.capacity;
+/**
+ * Every seating the restaurant offers under `terms`: singles in fixture order, then pairs in
+ * `combinable` order, each with the capacity those terms give it (a pair seats the sum).
+ */
+export function seatingOptions(restaurant: Restaurant, terms: Terms): SeatingOption[] {
+  const capacity = (id: string) => terms.capacities[id];
   return [
-    ...restaurant.tables.map((t) => ({ table_ids: [t.id], capacity: t.capacity })),
+    ...restaurant.tables.map((t) => ({ table_ids: [t.id], capacity: capacity(t.id) })),
     ...restaurant.combinable.map((pair) => ({ table_ids: [...pair], capacity: capacity(pair[0]) + capacity(pair[1]) })),
   ];
 }
@@ -52,8 +58,8 @@ export function parseStartsAtLocal(text: string): LocalDateTime {
   return parsed;
 }
 
-function timingAt(restaurant: Restaurant, local: LocalDateTime, startMs: number): Timing {
-  const endMs = startMs + restaurant.reservation_duration_minutes * MS_PER_MINUTE;
+function timingAt(restaurant: Restaurant, terms: Terms, local: LocalDateTime, startMs: number): Timing {
+  const endMs = startMs + terms.reservation_duration_minutes * MS_PER_MINUTE;
   return {
     starts_at_local: formatLocalDateTime(local),
     starts_at: formatInstant(restaurant.timezone, startMs),
@@ -63,38 +69,46 @@ function timingAt(restaurant: Restaurant, local: LocalDateTime, startMs: number)
   };
 }
 
-const hoursOn = (restaurant: Restaurant, date: LocalDate) =>
-  restaurant.opening_hours.filter((h) => h.weekday === weekdayOf(date));
+const hoursOn = (terms: Terms, date: LocalDate) =>
+  terms.opening_hours.filter((h) => h.weekday === weekdayOf(date));
 
 const closesMs = (restaurant: Restaurant, date: LocalDate, hours: OpeningHours) =>
   resolveLocalLenient(restaurant.timezone, atMinute(date, parseClock(hours.closes)!));
 
 /**
- * The timing of a booking starting at `local`, or the rule it breaks:
+ * The timing of a booking starting at `local` under `terms`, or the rule it breaks:
  * a skipped local time, a start outside opening hours, a start off the slot grid,
  * or an end after closing time.
  */
-export function bookingTiming(restaurant: Restaurant, local: LocalDateTime): Timing {
+export function bookingTiming(restaurant: Restaurant, terms: Terms, local: LocalDateTime): Timing {
   const startMs = resolveLocal(restaurant.timezone, local);
   if (startMs === null) {
     throw unprocessable('invalid_local_time', 'That local time does not exist in the restaurant\'s time zone');
   }
   const minute = minuteOfDay(local);
-  const hours = hoursOn(restaurant, local).find(
+  const hours = hoursOn(terms, local).find(
     (h) => parseClock(h.opens)! <= minute && minute < parseClock(h.closes)!);
   const outside = () => unprocessable('outside_opening_hours', 'The restaurant is not open for that booking');
   if (!hours) throw outside();
-  if ((minute - parseClock(hours.opens)!) % restaurant.slot_minutes !== 0) {
+  if ((minute - parseClock(hours.opens)!) % terms.slot_minutes !== 0) {
     throw unprocessable('not_on_slot_grid', 'starts_at_local is not on the restaurant\'s slot grid');
   }
-  const timing = timingAt(restaurant, local, startMs);
+  const timing = timingAt(restaurant, terms, local, startMs);
   if (timing.end_ms > closesMs(restaurant, local, hours)) throw outside();
   return timing;
 }
 
-/** True once now is within the cancellation cutoff of the start, or later (§8). */
-export function cutoffPassed(restaurant: Restaurant, startMs: number, nowMs = Date.now()): boolean {
-  return nowMs >= startMs - restaurant.cancellation_cutoff_minutes * MS_PER_MINUTE;
+/** True once now is within `cutoffMinutes` of the start, or later (§8). */
+export function cutoffPassed(cutoffMinutes: number, startMs: number, nowMs = Date.now()): boolean {
+  return nowMs >= startMs - cutoffMinutes * MS_PER_MINUTE;
+}
+
+/** Why one table is or is not available for a slot (stage 3 `explain`). */
+export interface TableExplanation {
+  table_id: string;
+  policy_version: number;
+  available: boolean;
+  rules: [{ rule: 'capacity'; holds: boolean }, { rule: 'no_overlap'; holds: boolean }];
 }
 
 export interface Slot {
@@ -102,35 +116,49 @@ export interface Slot {
   starts_at: string;
   available_table_ids: string[];
   available_options: SeatingOption[];
+  explain?: TableExplanation[];
 }
 
 /**
- * Every slot of `date`: each slot_minutes step from opens whose reservation ends by closes.
- * Skipped local times are absent; repeated ones appear once, at their first occurrence.
+ * Every slot of `date` under `terms`: each slot_minutes step from opens whose reservation
+ * ends by closes. Skipped local times are absent; repeated ones appear once, at their first
+ * occurrence. With `explain`, every table reports both rules, each judged independently.
  */
 export function slotsOn(
-  restaurant: Restaurant, date: LocalDate, partySize: number, occupied: Occupancy[],
+  restaurant: Restaurant, terms: Terms, date: LocalDate, partySize: number, occupied: Occupancy[], explain: boolean,
 ): Slot[] {
   const seen = new Set<string>();
-  const options = seatingOptions(restaurant).filter((o) => o.capacity >= partySize);
+  const options = seatingOptions(restaurant, terms).filter((o) => o.capacity >= partySize);
   const slots: (Slot & { start_ms: number })[] = [];
-  for (const hours of hoursOn(restaurant, date)) {
+  for (const hours of hoursOn(terms, date)) {
     const closes = parseClock(hours.closes)!;
     const closing = closesMs(restaurant, date, hours);
-    for (let minute = parseClock(hours.opens)!; minute < closes; minute += restaurant.slot_minutes) {
+    for (let minute = parseClock(hours.opens)!; minute < closes; minute += terms.slot_minutes) {
       const local = atMinute(date, minute);
       const startMs = resolveLocal(restaurant.timezone, local);
       if (startMs === null) continue;
-      const timing = timingAt(restaurant, local, startMs);
+      const timing = timingAt(restaurant, terms, local, startMs);
       if (timing.end_ms > closing || seen.has(timing.starts_at_local)) continue;
       seen.add(timing.starts_at_local);
-      const free = options.filter((o) => !occupied.some((held) => overlaps(held, { ...timing, table_ids: o.table_ids })));
-      slots.push({
+      const isFree = (tableIds: string[]) => !occupied.some((held) => overlaps(held, { ...timing, table_ids: tableIds }));
+      const free = options.filter((o) => isFree(o.table_ids));
+      const slot: Slot & { start_ms: number } = {
         starts_at_local: timing.starts_at_local, starts_at: timing.starts_at,
         available_table_ids: free.filter((o) => o.table_ids.length === 1).map((o) => o.table_ids[0]),
         available_options: free,
         start_ms: startMs,
-      });
+      };
+      if (explain) {
+        slot.explain = restaurant.tables.map((t) => {
+          const capacity = terms.capacities[t.id] >= partySize;
+          const noOverlap = isFree([t.id]);
+          return {
+            table_id: t.id, policy_version: terms.policy_version, available: capacity && noOverlap,
+            rules: [{ rule: 'capacity', holds: capacity }, { rule: 'no_overlap', holds: noOverlap }],
+          };
+        });
+      }
+      slots.push(slot);
     }
   }
   return slots

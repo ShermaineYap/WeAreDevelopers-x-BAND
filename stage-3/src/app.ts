@@ -4,15 +4,18 @@ import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { authenticate, login, signup } from './auth';
 import {
-  API_BODY_LIMIT, EXPORT_FORMAT_VERSION, EXPORT_TRACK, PATH_MOVES, PATH_RESERVATIONS, TEST_BODY_LIMIT,
+  API_BODY_LIMIT, EXPORT_FORMAT_VERSION, EXPORT_TRACK, PATH_MOVES, PATH_RESERVATIONS, PATH_SERIES,
+  TEST_BODY_LIMIT, policiesPath,
 } from './constants';
 import { ApiError, malformed, notFound, validationFailed } from './errors';
 import { stateFromFixture } from './fixture';
 import { idempotencyKey, idempotent, type Outcome } from './idempotency';
+import { listPolicies, publishPolicy, termsFor } from './policies';
 import {
-  amendReservation, cancelReservation, createReservation, getReservation, listReservations,
-  moveReservations, occupancyOf,
+  amendReservation, cancelReservation, createReservation, getDecision, getHistory, getReservation,
+  listReservations, moveReservations, occupancyOf,
 } from './reservations';
+import { adoptSeries, getSeries } from './series';
 import { renderPage, SCREEN_ROUTES } from './pages';
 import { slotsOn } from './schedule';
 import { isObject, type JsonObject } from './shape';
@@ -35,6 +38,15 @@ function jsonBody(req: Request): JsonObject {
 }
 
 const userOf = (req: Request) => authenticate(req.get('authorization'));
+
+/** The caller, or null when there is no valid token (owner-only reads answer 404 then). */
+function optionalUserOf(req: Request): string | null {
+  try {
+    return userOf(req);
+  } catch {
+    return null;
+  }
+}
 
 function send(res: Response, outcome: Outcome): void {
   if (outcome.status === 204) res.status(204).end();
@@ -79,13 +91,17 @@ function availability(req: Request): Outcome {
   if (!PLAIN_DIGITS.test(party) || Number(party) < 1) {
     throw validationFailed('party_size must be a positive integer written as plain decimal digits');
   }
+  // Stage 3: `explain` is optional and its only accepted value is "true".
+  const explain = params.get('explain');
+  if (explain !== null && explain !== 'true') throw validationFailed('explain must be "true" when given');
   const restaurant = findRestaurant(restaurantId);
   if (!restaurant) throw notFound('No such restaurant');
   return ok({
     restaurant_id: restaurant.id,
     date: formatDate(date),
     timezone: restaurant.timezone,
-    slots: slotsOn(restaurant, date, Number(party), occupancyOf(restaurant.id)),
+    slots: slotsOn(restaurant, termsFor(restaurant, formatDate(date)), date, Number(party),
+      occupancyOf(restaurant.id), explain === 'true'),
   });
 }
 
@@ -112,12 +128,15 @@ function importAll(req: Request): Outcome {
 
 // ---------- idempotent writes (§7): auth, body, key, then the idempotency record ----------
 
-function idempotentWrite(path: string, run: (userId: string, body: JsonObject) => Outcome): Handler {
+function idempotentWrite(
+  path: string | ((req: Request) => string), run: (userId: string, body: JsonObject, req: Request) => Outcome,
+): Handler {
   return (req) => {
     const userId = userOf(req);
     const body = jsonBody(req);
     const key = idempotencyKey(req.get('idempotency-key'));
-    return idempotent(userId, path, key, body, () => run(userId, body));
+    const scope = typeof path === 'string' ? path : path(req);
+    return idempotent(userId, scope, key, body, () => run(userId, body, req));
   };
 }
 
@@ -158,11 +177,17 @@ export function createApp(): express.Express {
     if (!restaurant) throw notFound('No such restaurant');
     return ok(restaurant);
   }));
+  app.get('/restaurants/:id/policies', route((req) => listPolicies(param(req, 'id'))));
+  app.post('/restaurants/:id/policies', route(idempotentWrite(
+    (req) => policiesPath(param(req, 'id')),
+    (userId, body, req) => publishPolicy(userId, param(req, 'id'), body))));
   app.get('/availability', route(availability));
 
   app.post(PATH_RESERVATIONS, route(idempotentWrite(PATH_RESERVATIONS, createReservation)));
   app.get('/reservations', route((req) => listReservations(userOf(req))));
   app.get('/reservations/:reference', route((req) => getReservation(userOf(req), param(req, 'reference'))));
+  app.get('/reservations/:reference/history', route((req) => getHistory(optionalUserOf(req), param(req, 'reference'))));
+  app.get('/reservations/:reference/decision', route((req) => getDecision(optionalUserOf(req), param(req, 'reference'))));
   app.post('/reservations/:reference/cancel', route((req) =>
     cancelReservation(userOf(req), param(req, 'reference'))));
   app.patch('/reservations/:reference', route((req) => {
@@ -170,6 +195,8 @@ export function createApp(): express.Express {
     return amendReservation(userId, param(req, 'reference'), jsonBody(req));
   }));
   app.post(PATH_MOVES, route(idempotentWrite(PATH_MOVES, moveReservations)));
+  app.post(PATH_SERIES, route(idempotentWrite(PATH_SERIES, adoptSeries)));
+  app.get('/series/:id', route((req) => getSeries(optionalUserOf(req), param(req, 'id'))));
 
   app.use(route(() => {
     throw notFound('No such endpoint');
