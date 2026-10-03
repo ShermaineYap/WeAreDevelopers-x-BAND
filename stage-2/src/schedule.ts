@@ -16,16 +16,34 @@ export interface Timing {
   end_ms: number;
 }
 
-/** A confirmed booking's hold on a table. */
+/** A confirmed booking's hold on every table in its set. */
 export interface Occupancy {
-  table_id: string;
+  table_ids: string[];
   start_ms: number;
   end_ms: number;
 }
 
-/** Half-open intervals overlap when each starts before the other ends (§1). */
+/**
+ * Two holds conflict when they share a table and their half-open intervals overlap,
+ * i.e. each starts before the other ends (§1).
+ */
 export const overlaps = (a: Occupancy, b: Occupancy) =>
-  a.table_id === b.table_id && a.start_ms < b.end_ms && b.start_ms < a.end_ms;
+  a.start_ms < b.end_ms && b.start_ms < a.end_ms && a.table_ids.some((id) => b.table_ids.includes(id));
+
+/** A bookable seating: one table, or a declared pair in `combinable` order. */
+export interface SeatingOption {
+  table_ids: string[];
+  capacity: number;
+}
+
+/** Every seating the restaurant offers: singles in fixture order, then pairs in `combinable` order. */
+export function seatingOptions(restaurant: Restaurant): SeatingOption[] {
+  const capacity = (id: string) => restaurant.tables.find((t) => t.id === id)!.capacity;
+  return [
+    ...restaurant.tables.map((t) => ({ table_ids: [t.id], capacity: t.capacity })),
+    ...restaurant.combinable.map((pair) => ({ table_ids: [...pair], capacity: capacity(pair[0]) + capacity(pair[1]) })),
+  ];
+}
 
 /** `starts_at_local` must be a bare `YYYY-MM-DDTHH:MM` naming a real calendar time. */
 export function parseStartsAtLocal(text: string): LocalDateTime {
@@ -83,6 +101,7 @@ export interface Slot {
   starts_at_local: string;
   starts_at: string;
   available_table_ids: string[];
+  available_options: SeatingOption[];
 }
 
 /**
@@ -93,6 +112,7 @@ export function slotsOn(
   restaurant: Restaurant, date: LocalDate, partySize: number, occupied: Occupancy[],
 ): Slot[] {
   const seen = new Set<string>();
+  const options = seatingOptions(restaurant).filter((o) => o.capacity >= partySize);
   const slots: (Slot & { start_ms: number })[] = [];
   for (const hours of hoursOn(restaurant, date)) {
     const closes = parseClock(hours.closes)!;
@@ -104,17 +124,16 @@ export function slotsOn(
       const timing = timingAt(restaurant, local, startMs);
       if (timing.end_ms > closing || seen.has(timing.starts_at_local)) continue;
       seen.add(timing.starts_at_local);
-      const available = restaurant.tables
-        .filter((t) => t.capacity >= partySize)
-        .filter((t) => !occupied.some((o) => overlaps(o, { ...timing, table_id: t.id })))
-        .map((t) => t.id);
+      const free = options.filter((o) => !occupied.some((held) => overlaps(held, { ...timing, table_ids: o.table_ids })));
       slots.push({
         starts_at_local: timing.starts_at_local, starts_at: timing.starts_at,
-        available_table_ids: available, start_ms: startMs,
+        available_table_ids: free.filter((o) => o.table_ids.length === 1).map((o) => o.table_ids[0]),
+        available_options: free,
+        start_ms: startMs,
       });
     }
   }
   return slots
     .sort((a, b) => a.start_ms - b.start_ms)
-    .map(({ starts_at_local, starts_at, available_table_ids }) => ({ starts_at_local, starts_at, available_table_ids }));
+    .map(({ start_ms: _ignored, ...slot }) => slot);
 }

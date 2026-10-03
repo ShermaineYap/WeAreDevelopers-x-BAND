@@ -1,12 +1,16 @@
 // POST /_test/reset fixtures (§3.3, §4) turned into a complete StoreState.
-import { MS_PER_MINUTE, REFERENCE_PATTERN } from './constants';
+import { MAX_TABLES_PER_BOOKING, MS_PER_MINUTE, REFERENCE_PATTERN } from './constants';
 import { hashPassword } from './auth';
 import { validationFailed } from './errors';
 import { overlaps } from './schedule';
 import {
-  expectDistinct, expectId, expectInteger, expectObject, expectString, optionalArray,
+  expectArray, expectDistinct, expectId, expectInteger, expectObject, expectString, hasField, optionalArray,
+  type JsonObject,
 } from './shape';
-import { emailKey, parseRestaurant, type Restaurant, type ReservationRow, type StoreState } from './state';
+import {
+  RESERVATION_STATUSES, declaredPair, emailKey, parseRestaurant, type Restaurant, type ReservationRow,
+  type ReservationStatus, type StoreState,
+} from './state';
 import { formatInstant, formatLocalDateTime, formatUtcNow, parseLocalDateTime, resolveLocal } from './time';
 
 interface SeedUser {
@@ -27,9 +31,11 @@ function parseUser(value: unknown, path: string): SeedUser {
 }
 
 /**
- * A seeded reservation is a confirmed booking with the POST body's fields plus id, reference
- * and user_id. Its start may be any date (including the past) and is not held to the slot
- * grid; it must name a real local time, fit its table and not overlap another seed.
+ * A seeded reservation has the POST body's fields plus id, reference and user_id, and is
+ * confirmed unless it carries `status: "cancelled"`. It may name `table_id` or `table_ids`.
+ * Its start may be any date (including the past) and is not held to the slot grid; it must
+ * name a real local time and declared tables that seat the party, and a confirmed seed must
+ * not overlap another.
  */
 function parseSeed(
   value: unknown, path: string, restaurants: Map<string, Restaurant>, userIds: Set<string>, createdAt: string,
@@ -41,11 +47,12 @@ function parseSeed(
   if (!REFERENCE_PATTERN.test(reference)) throw validationFailed(`${path}.reference must match ${REFERENCE_PATTERN}`);
   const restaurant = restaurants.get(expectId(r, 'restaurant_id', path));
   if (!restaurant) throw validationFailed(`${path}.restaurant_id names an unknown restaurant`);
-  const tableId = expectId(r, 'table_id', path);
-  const table = restaurant.tables.find((t) => t.id === tableId);
-  if (!table) throw validationFailed(`${path}.table_id is not a table of that restaurant`);
+  const tableIds = seedTables(r, path, restaurant);
+  const capacity = tableIds.reduce((sum, id) => sum + restaurant.tables.find((t) => t.id === id)!.capacity, 0);
   const partySize = expectInteger(r, 'party_size', path, 1);
-  if (partySize > table.capacity) throw validationFailed(`${path}.party_size exceeds the table's capacity`);
+  if (partySize > capacity) throw validationFailed(`${path}.party_size exceeds the tables' capacity`);
+  const status = hasField(r, 'status') ? expectString(r, 'status', path) : 'confirmed';
+  if (!RESERVATION_STATUSES.includes(status)) throw validationFailed(`${path}.status must be confirmed or cancelled`);
   const local = parseLocalDateTime(expectString(r, 'starts_at_local', path));
   if (!local) throw validationFailed(`${path}.starts_at_local must be a local YYYY-MM-DDTHH:MM`);
   const startMs = resolveLocal(restaurant.timezone, local);
@@ -56,9 +63,9 @@ function parseSeed(
     reference,
     user_id: userId,
     restaurant_id: restaurant.id,
-    table_id: tableId,
+    table_ids: tableIds,
     party_size: partySize,
-    status: 'confirmed',
+    status: status as ReservationStatus,
     starts_at_local: formatLocalDateTime(local),
     starts_at: formatInstant(restaurant.timezone, startMs),
     ends_at: formatInstant(restaurant.timezone, endMs),
@@ -66,6 +73,29 @@ function parseSeed(
     end_ms: endMs,
     created_at: createdAt,
   };
+}
+
+/** A seed's table set: `table_id` or `table_ids`, known tables, a pair only if declared. */
+function seedTables(r: JsonObject, path: string, restaurant: Restaurant): string[] {
+  if (hasField(r, 'table_id') === hasField(r, 'table_ids')) {
+    throw validationFailed(`${path} must carry exactly one of table_id and table_ids`);
+  }
+  const ids = hasField(r, 'table_id')
+    ? [expectId(r, 'table_id', path)]
+    : expectArray(r.table_ids, `${path}.table_ids`);
+  if (ids.length === 0 || ids.length > MAX_TABLES_PER_BOOKING || ids.some((id) => typeof id !== 'string')) {
+    throw validationFailed(`${path}.table_ids must hold one table or a declared pair`);
+  }
+  const tableIds = ids as string[];
+  if (!tableIds.every((id) => restaurant.tables.some((t) => t.id === id))) {
+    throw validationFailed(`${path} names a table that is not in that restaurant`);
+  }
+  if (tableIds.length === 2) {
+    const pair = declaredPair(restaurant, tableIds[0], tableIds[1]);
+    if (!pair) throw validationFailed(`${path}.table_ids is not a declared combination`);
+    return [...pair];
+  }
+  return tableIds;
 }
 
 /** Validates a whole fixture (422 on any defect) and hashes its passwords. */
@@ -84,7 +114,8 @@ export async function stateFromFixture(value: unknown): Promise<StoreState> {
   expectDistinct(reservations.map((r) => r.id), 'reservation id');
   expectDistinct(reservations.map((r) => r.reference), 'reservation reference');
   reservations.forEach((r, i) => {
-    if (reservations.some((o, j) => j < i && o.restaurant_id === r.restaurant_id && overlaps(o, r))) {
+    const confirmed = (x: ReservationRow) => x.status === 'confirmed';
+    if (confirmed(r) && reservations.some((o, j) => j < i && confirmed(o) && o.restaurant_id === r.restaurant_id && overlaps(o, r))) {
       throw validationFailed(`reservations[${i}] overlaps another seeded reservation`);
     }
   });

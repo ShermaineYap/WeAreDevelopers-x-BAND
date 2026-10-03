@@ -1,7 +1,9 @@
 // The whole service state as plain records: how it is read, replaced (reset/import) and
 // exported. Reset, import and export all go through replaceState/snapshotState, so there is
 // one definition of "all state".
-import { REFERENCE_PATTERN, STATE_SCHEMA, WEEKDAYS, type Weekday } from './constants';
+import {
+  LEGACY_STATE_SCHEMA, REFERENCE_PATTERN, STATE_SCHEMA, WEEKDAYS, type Weekday,
+} from './constants';
 import { db, inTransaction } from './db';
 import { validationFailed } from './errors';
 import {
@@ -22,6 +24,9 @@ export interface TableRecord {
   capacity: number;
 }
 
+/** A declared combinable pair, in the order the fixture gave it. */
+export type TablePair = [string, string];
+
 export interface Restaurant {
   id: string;
   name: string;
@@ -31,6 +36,7 @@ export interface Restaurant {
   cancellation_cutoff_minutes: number;
   opening_hours: OpeningHours[];
   tables: TableRecord[];
+  combinable: TablePair[];
 }
 
 export interface UserRow {
@@ -46,13 +52,15 @@ export interface TokenRow {
 }
 
 export type ReservationStatus = 'confirmed' | 'cancelled';
+export const RESERVATION_STATUSES: readonly string[] = ['confirmed', 'cancelled'];
 
 export interface ReservationRow {
   id: string;
   reference: string;
   user_id: string;
   restaurant_id: string;
-  table_id: string;
+  /** One table, or a declared pair. */
+  table_ids: string[];
   party_size: number;
   status: ReservationStatus;
   starts_at_local: string;
@@ -82,9 +90,14 @@ export interface StoreState {
 /** Case-insensitive identity of an email address. */
 export const emailKey = (email: string) => email.toLowerCase();
 
+/** The declared pair holding exactly these two tables, in either order. */
+export function declaredPair(restaurant: Restaurant, a: string, b: string): TablePair | undefined {
+  return restaurant.combinable.find(([x, y]) => (x === a && y === b) || (x === b && y === a));
+}
+
 // ---------- restaurants ----------
 
-/** Validates a restaurant in the fixture's shape (§4). Used by reset and import alike. */
+/** Validates a restaurant in the fixture's shape (§4, stage 2 `combinable`). Used by reset and import. */
 export function parseRestaurant(value: unknown, path: string): Restaurant {
   const r = expectObject(value, path);
   const timezone = expectString(r, 'timezone', path);
@@ -94,7 +107,7 @@ export function parseRestaurant(value: unknown, path: string): Restaurant {
   const tables = expectArray(r.tables, `${path}.tables`).map((t, i) =>
     parseTable(t, `${path}.tables[${i}]`));
   expectDistinct(tables.map((t) => t.id), `table id in ${path}`);
-  return {
+  const restaurant: Restaurant = {
     id: expectId(r, 'id', path),
     name: expectString(r, 'name', path),
     timezone,
@@ -103,7 +116,23 @@ export function parseRestaurant(value: unknown, path: string): Restaurant {
     cancellation_cutoff_minutes: expectInteger(r, 'cancellation_cutoff_minutes', path, 0),
     opening_hours,
     tables,
+    combinable: [],
   };
+  const pairs = hasField(r, 'combinable') && r.combinable !== null
+    ? expectArray(r.combinable, `${path}.combinable`) : [];
+  pairs.forEach((pair, i) => {
+    const p = `${path}.combinable[${i}]`;
+    if (!Array.isArray(pair) || pair.length !== 2 || pair.some((id) => typeof id !== 'string')) {
+      throw validationFailed(`${p} must be a pair of table ids`);
+    }
+    const [a, b] = pair as string[];
+    if (a === b || !tables.some((t) => t.id === a) || !tables.some((t) => t.id === b)) {
+      throw validationFailed(`${p} must name two different tables of this restaurant`);
+    }
+    if (declaredPair(restaurant, a, b)) throw validationFailed(`${p} repeats a declared pair`);
+    restaurant.combinable.push([a, b]);
+  });
+  return restaurant;
 }
 
 function parseOpeningHours(value: unknown, path: string): OpeningHours {
@@ -127,23 +156,27 @@ function parseTable(value: unknown, path: string): TableRecord {
   return table;
 }
 
-type RestaurantDbRow = Omit<Restaurant, 'opening_hours' | 'tables'> & { opening_hours: string };
+type RestaurantDbRow = Omit<Restaurant, 'opening_hours' | 'tables' | 'combinable'> & {
+  opening_hours: string;
+  combinable: string;
+};
 
-const selectRestaurants = db.prepare(
-  `SELECT id, name, timezone, slot_minutes, reservation_duration_minutes,
-          cancellation_cutoff_minutes, opening_hours
-     FROM restaurants ORDER BY position`);
-const selectRestaurant = db.prepare(
-  `SELECT id, name, timezone, slot_minutes, reservation_duration_minutes,
-          cancellation_cutoff_minutes, opening_hours
-     FROM restaurants WHERE id = ?`);
+const RESTAURANT_COLUMNS = `id, name, timezone, slot_minutes, reservation_duration_minutes,
+  cancellation_cutoff_minutes, opening_hours, combinable`;
+const selectRestaurants = db.prepare(`SELECT ${RESTAURANT_COLUMNS} FROM restaurants ORDER BY position`);
+const selectRestaurant = db.prepare(`SELECT ${RESTAURANT_COLUMNS} FROM restaurants WHERE id = ?`);
 const selectTables = db.prepare(
   'SELECT id, label, capacity FROM restaurant_tables WHERE restaurant_id = ? ORDER BY position');
 
 function hydrate(row: RestaurantDbRow): Restaurant {
   const tables = (selectTables.all(row.id) as { id: string; label: string | null; capacity: number }[])
     .map(({ id, label, capacity }) => (label === null ? { id, capacity } : { id, label, capacity }));
-  return { ...row, opening_hours: JSON.parse(row.opening_hours) as OpeningHours[], tables };
+  return {
+    ...row,
+    opening_hours: JSON.parse(row.opening_hours) as OpeningHours[],
+    tables,
+    combinable: JSON.parse(row.combinable) as TablePair[],
+  };
 }
 
 export function listRestaurants(): Restaurant[] {
@@ -155,6 +188,29 @@ export function findRestaurant(id: string): Restaurant | undefined {
   return row && hydrate(row);
 }
 
+// ---------- reservation rows ----------
+
+/** Column list matching ReservationDbRow; table_ids is stored as a JSON array. */
+export const RESERVATION_COLUMNS = `id, reference, user_id, restaurant_id, table_ids, party_size, status,
+  starts_at_local, starts_at, ends_at, start_ms, end_ms, created_at`;
+
+type ReservationDbRow = Omit<ReservationRow, 'table_ids'> & { table_ids: string };
+
+export const toDbRow = (r: ReservationRow): ReservationDbRow => ({ ...r, table_ids: JSON.stringify(r.table_ids) });
+export const fromDbRow = (r: unknown): ReservationRow => {
+  const row = r as ReservationDbRow;
+  return { ...row, table_ids: JSON.parse(row.table_ids) as string[] };
+};
+
+const insertReservationStmt = db.prepare(
+  `INSERT INTO reservations (${RESERVATION_COLUMNS})
+   VALUES (@id, @reference, @user_id, @restaurant_id, @table_ids, @party_size, @status,
+           @starts_at_local, @starts_at, @ends_at, @start_ms, @end_ms, @created_at)`);
+
+export function insertReservation(row: ReservationRow): void {
+  insertReservationStmt.run(toDbRow(row));
+}
+
 // ---------- replace / snapshot ----------
 
 const insertUser = db.prepare(
@@ -163,17 +219,12 @@ const insertUser = db.prepare(
 const insertToken = db.prepare('INSERT INTO tokens (token_hash, user_id) VALUES (@token_hash, @user_id)');
 const insertRestaurant = db.prepare(
   `INSERT INTO restaurants (id, position, name, timezone, slot_minutes, reservation_duration_minutes,
-                            cancellation_cutoff_minutes, opening_hours)
+                            cancellation_cutoff_minutes, opening_hours, combinable)
    VALUES (@id, @position, @name, @timezone, @slot_minutes, @reservation_duration_minutes,
-           @cancellation_cutoff_minutes, @opening_hours)`);
+           @cancellation_cutoff_minutes, @opening_hours, @combinable)`);
 const insertTable = db.prepare(
   `INSERT INTO restaurant_tables (restaurant_id, id, position, label, capacity)
    VALUES (@restaurant_id, @id, @position, @label, @capacity)`);
-export const insertReservation = db.prepare(
-  `INSERT INTO reservations (id, reference, user_id, restaurant_id, table_id, party_size, status,
-                             starts_at_local, starts_at, ends_at, start_ms, end_ms, created_at)
-   VALUES (@id, @reference, @user_id, @restaurant_id, @table_id, @party_size, @status,
-           @starts_at_local, @starts_at, @ends_at, @start_ms, @end_ms, @created_at)`);
 const insertIdempotency = db.prepare(
   `INSERT INTO idempotency (user_id, path, key, request_hash, response)
    VALUES (@user_id, @path, @key, @request_hash, @response)`);
@@ -193,12 +244,13 @@ export function replaceState(state: StoreState): void {
           reservation_duration_minutes: r.reservation_duration_minutes,
           cancellation_cutoff_minutes: r.cancellation_cutoff_minutes,
           opening_hours: JSON.stringify(r.opening_hours),
+          combinable: JSON.stringify(r.combinable),
         });
         r.tables.forEach((t, i) => insertTable.run({
           restaurant_id: r.id, id: t.id, position: i, label: t.label ?? null, capacity: t.capacity,
         }));
       });
-      for (const r of state.reservations) insertReservation.run(r);
+      for (const r of state.reservations) insertReservation(r);
       for (const i of state.idempotency) insertIdempotency.run(i);
     });
   } catch (err) {
@@ -215,10 +267,7 @@ export function snapshotState(): StoreState {
     users: db.prepare('SELECT id, email, password_hash, display_name FROM users ORDER BY rowid').all() as UserRow[],
     tokens: db.prepare('SELECT token_hash, user_id FROM tokens ORDER BY rowid').all() as TokenRow[],
     restaurants: listRestaurants(),
-    reservations: db.prepare(
-      `SELECT id, reference, user_id, restaurant_id, table_id, party_size, status, starts_at_local,
-              starts_at, ends_at, start_ms, end_ms, created_at
-         FROM reservations ORDER BY rowid`).all() as ReservationRow[],
+    reservations: db.prepare(`SELECT ${RESERVATION_COLUMNS} FROM reservations ORDER BY rowid`).all().map(fromDbRow),
     idempotency: db.prepare(
       'SELECT user_id, path, key, request_hash, response FROM idempotency ORDER BY rowid').all() as IdempotencyRow[],
   }));
@@ -230,13 +279,25 @@ export function serializeState(state: StoreState): JsonObject {
   return { schema: STATE_SCHEMA, ...state };
 }
 
+/** Reads a reservation's table set: `table_ids` (current) or `table_id` (stage-1 exports). */
+function exportedTableIds(r: JsonObject, path: string, legacy: boolean): string[] {
+  if (legacy) return [expectString(r, 'table_id', path)];
+  const ids = expectArray(r.table_ids, `${path}.table_ids`);
+  if (ids.some((id) => typeof id !== 'string')) throw validationFailed(`${path}.table_ids must hold strings`);
+  return ids as string[];
+}
+
 /**
- * Validates an exported `state` object. Anything this service could not have produced is
- * rejected with 422 before the destination is touched.
+ * Validates an exported `state` object, including stage-1 exports, which are upgraded on the
+ * way in. Anything this service could not have produced is rejected with 422 before the
+ * destination is touched.
  */
 export function deserializeState(value: unknown): StoreState {
   const s = expectObject(value, 'state');
-  if (s.schema !== STATE_SCHEMA) throw validationFailed('state was not produced by this service');
+  if (s.schema !== STATE_SCHEMA && s.schema !== LEGACY_STATE_SCHEMA) {
+    throw validationFailed('state was not produced by this service');
+  }
+  const legacy = s.schema === LEGACY_STATE_SCHEMA;
   const users = expectArray(s.users, 'state.users').map((v, i) => {
     const p = `state.users[${i}]`; const u = expectObject(v, p);
     return { id: expectId(u, 'id', p), email: expectString(u, 'email', p),
@@ -259,18 +320,21 @@ export function deserializeState(value: unknown): StoreState {
     const row: ReservationRow = {
       id: expectId(r, 'id', p), reference: expectString(r, 'reference', p),
       user_id: knownUser(expectString(r, 'user_id', p), p),
-      restaurant_id: expectString(r, 'restaurant_id', p), table_id: expectString(r, 'table_id', p),
+      restaurant_id: expectString(r, 'restaurant_id', p), table_ids: exportedTableIds(r, p, legacy),
       party_size: expectInteger(r, 'party_size', p, 1), status: expectString(r, 'status', p) as ReservationStatus,
       starts_at_local: expectString(r, 'starts_at_local', p), starts_at: expectString(r, 'starts_at', p),
       ends_at: expectString(r, 'ends_at', p), start_ms: expectInteger(r, 'start_ms', p, -8.64e15),
       end_ms: expectInteger(r, 'end_ms', p, -8.64e15), created_at: expectString(r, 'created_at', p),
     };
     const restaurant = byId.get(row.restaurant_id);
-    if (!restaurant || !restaurant.tables.some((t) => t.id === row.table_id)) {
-      throw validationFailed(`${p} names an unknown restaurant or table`);
+    const [a, b, ...rest] = row.table_ids;
+    const knownTables = restaurant !== undefined && row.table_ids.length > 0
+      && row.table_ids.every((id) => restaurant.tables.some((t) => t.id === id));
+    if (!knownTables || rest.length > 0 || (b !== undefined && !declaredPair(restaurant, a, b))) {
+      throw validationFailed(`${p} names an unknown restaurant, table or combination`);
     }
     if (!REFERENCE_PATTERN.test(row.reference)) throw validationFailed(`${p}.reference is malformed`);
-    if (row.status !== 'confirmed' && row.status !== 'cancelled') throw validationFailed(`${p}.status is unknown`);
+    if (!RESERVATION_STATUSES.includes(row.status)) throw validationFailed(`${p}.status is unknown`);
     if (!parseLocalDateTime(row.starts_at_local) || Date.parse(row.starts_at) !== row.start_ms
       || Date.parse(row.ends_at) !== row.end_ms || row.end_ms <= row.start_ms
       || Number.isNaN(Date.parse(row.created_at))) {

@@ -26,7 +26,8 @@ db.exec(`
     slot_minutes                 INTEGER NOT NULL,
     reservation_duration_minutes INTEGER NOT NULL,
     cancellation_cutoff_minutes  INTEGER NOT NULL,
-    opening_hours                TEXT NOT NULL
+    opening_hours                TEXT NOT NULL,
+    combinable                   TEXT NOT NULL
   );
   CREATE TABLE restaurant_tables (
     restaurant_id TEXT NOT NULL,
@@ -41,7 +42,7 @@ db.exec(`
     reference       TEXT NOT NULL UNIQUE,
     user_id         TEXT NOT NULL,
     restaurant_id   TEXT NOT NULL,
-    table_id        TEXT NOT NULL,
+    table_ids       TEXT NOT NULL,
     party_size      INTEGER NOT NULL,
     status          TEXT NOT NULL,
     starts_at_local TEXT NOT NULL,
@@ -51,7 +52,7 @@ db.exec(`
     end_ms          INTEGER NOT NULL,
     created_at      TEXT NOT NULL
   );
-  CREATE INDEX reservations_by_table ON reservations (restaurant_id, table_id, status, start_ms);
+  CREATE INDEX reservations_by_time ON reservations (restaurant_id, status, start_ms);
   CREATE INDEX reservations_by_user ON reservations (user_id);
   CREATE TABLE idempotency (
     user_id      TEXT NOT NULL,

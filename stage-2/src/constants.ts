@@ -31,8 +31,16 @@ export const TEST_BODY_LIMIT = '64mb';
 /** §10: the export envelope. */
 export const EXPORT_TRACK = 'tablekeeper';
 export const EXPORT_FORMAT_VERSION = 1;
-/** Marker inside the opaque `state` so foreign objects are recognised as invalid. */
-export const STATE_SCHEMA = 'tablekeeper-store/1';
+/**
+ * Marker inside the opaque `state` so foreign objects are recognised as invalid.
+ * Stage 1 wrote LEGACY_STATE_SCHEMA (single `table_id` per reservation, no `combinable`);
+ * imports of that format are upgraded on the way in.
+ */
+export const STATE_SCHEMA = 'tablekeeper-store/2';
+export const LEGACY_STATE_SCHEMA = 'tablekeeper-store/1';
+
+/** Stage 2: a combination is a declared pair, never three or more tables. */
+export const MAX_TABLES_PER_BOOKING = 2;
 
 export const WEEKDAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] as const;
 export type Weekday = (typeof WEEKDAYS)[number];

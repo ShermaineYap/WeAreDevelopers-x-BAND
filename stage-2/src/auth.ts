@@ -56,7 +56,8 @@ export async function signup(body: JsonObject): Promise<Session> {
   assertStringTyped(body, ['email', 'password', 'display_name']);
   const email = stringField(body, 'email', true)!;
   const password = stringField(body, 'password', true)!;
-  const displayName = stringField(body, 'display_name', true)!;
+  // display_name is optional; without one the account is named after the email's local part.
+  const displayName = stringField(body, 'display_name', false);
   if (!EMAIL_RE.test(email)) throw validationFailed('email must be of the form local@domain');
   if ([...password].length < MIN_PASSWORD_LENGTH) {
     throw validationFailed(`password must be at least ${MIN_PASSWORD_LENGTH} characters`);
@@ -68,8 +69,9 @@ export async function signup(body: JsonObject): Promise<Session> {
   return inTransaction(() => {
     if (selectUserByEmail.get(emailKey(email))) throw taken();
     const userId = newId('u');
-    insertUser.run(userId, email, emailKey(email), hash, displayName);
-    return { user_id: userId, display_name: displayName, token: issueToken(userId) };
+    const name = displayName ?? email.slice(0, email.lastIndexOf('@'));
+    insertUser.run(userId, email, emailKey(email), hash, name);
+    return { user_id: userId, display_name: name, token: issueToken(userId) };
   });
 }
 

@@ -2,43 +2,50 @@
 // Every function here is synchronous and is called inside one transaction, so its checks
 // and its writes see the same state.
 import { MAX_MOVES, MIN_MOVES } from './constants';
-import { db } from './db';
+import { db, inTransaction } from './db';
 import { conflict, notFound, unprocessable, validationFailed } from './errors';
-import { assertStringTyped, partySizeField, stringField } from './fields';
+import { assertStringTyped, assertTableSetTyped, partySizeField, stringField, tableSetField } from './fields';
 import { newId, newReference } from './ids';
 import type { Outcome } from './idempotency';
 import {
   bookingTiming, cutoffPassed, overlaps, parseStartsAtLocal, type Occupancy, type Timing,
 } from './schedule';
 import { isObject, type JsonObject } from './shape';
-import { findRestaurant, insertReservation, type Restaurant, type ReservationRow } from './state';
+import {
+  RESERVATION_COLUMNS, declaredPair, findRestaurant, fromDbRow, insertReservation, toDbRow,
+  type Restaurant, type ReservationRow,
+} from './state';
 import { formatUtcNow, parseLocalDateTime, type LocalDateTime } from './time';
-
-const RESERVATION_COLUMNS = `id, reference, user_id, restaurant_id, table_id, party_size, status,
-  starts_at_local, starts_at, ends_at, start_ms, end_ms, created_at`;
 
 const selectByReference = db.prepare(`SELECT ${RESERVATION_COLUMNS} FROM reservations WHERE reference = ?`);
 const selectByUser = db.prepare(
   `SELECT ${RESERVATION_COLUMNS} FROM reservations WHERE user_id = ? ORDER BY start_ms DESC, rowid DESC`);
 const selectOverlapping = db.prepare(
-  `SELECT id FROM reservations
-    WHERE restaurant_id = ? AND table_id = ? AND status = 'confirmed' AND start_ms < ? AND end_ms > ?`);
+  `SELECT id, table_ids, start_ms, end_ms FROM reservations
+    WHERE restaurant_id = ? AND status = 'confirmed' AND start_ms < ? AND end_ms > ?`);
 const selectConfirmedForRestaurant = db.prepare(
-  `SELECT table_id, start_ms, end_ms FROM reservations WHERE restaurant_id = ? AND status = 'confirmed'`);
-const updateBooking = db.prepare(
-  `UPDATE reservations SET table_id = @table_id, party_size = @party_size,
+  `SELECT table_ids, start_ms, end_ms FROM reservations WHERE restaurant_id = ? AND status = 'confirmed'`);
+const updateBookingStmt = db.prepare(
+  `UPDATE reservations SET table_ids = @table_ids, party_size = @party_size,
           starts_at_local = @starts_at_local, starts_at = @starts_at, ends_at = @ends_at,
           start_ms = @start_ms, end_ms = @end_ms
     WHERE id = @id`);
 const updateStatus = db.prepare('UPDATE reservations SET status = ? WHERE id = ?');
+const updateBooking = (row: ReservationRow) => updateBookingStmt.run(toDbRow(row));
 
-/** The public shape of a reservation (§8 create response). */
+const readHold = (r: { table_ids: string }) => JSON.parse(r.table_ids) as string[];
+
+/**
+ * The public shape of a reservation (§8 create response). `table_ids` is always present;
+ * `table_id` only when the set has exactly one member (stage 2).
+ */
 export function view(r: ReservationRow) {
   return {
     reservation_id: r.id,
     reference: r.reference,
     restaurant_id: r.restaurant_id,
-    table_id: r.table_id,
+    ...(r.table_ids.length === 1 ? { table_id: r.table_ids[0] } : {}),
+    table_ids: [...r.table_ids],
     party_size: r.party_size,
     status: r.status,
     starts_at_local: r.starts_at_local,
@@ -49,71 +56,85 @@ export function view(r: ReservationRow) {
 }
 
 export function occupancyOf(restaurantId: string): Occupancy[] {
-  return selectConfirmedForRestaurant.all(restaurantId) as Occupancy[];
+  return (selectConfirmedForRestaurant.all(restaurantId) as (Omit<Occupancy, 'table_ids'> & { table_ids: string })[])
+    .map((r) => ({ ...r, table_ids: readHold(r) }));
 }
 
 /** The caller's reservation by reference; anyone else's is indistinguishable from none. */
 function ownReservation(userId: string, reference: string): ReservationRow {
-  const row = selectByReference.get(reference) as ReservationRow | undefined;
-  if (!row || row.user_id !== userId) throw notFound('No such reservation');
-  return row;
+  const row = selectByReference.get(reference);
+  if (!row || (row as ReservationRow).user_id !== userId) throw notFound('No such reservation');
+  return fromDbRow(row);
 }
 
 const referenceTaken = (reference: string) => selectByReference.get(reference) !== undefined;
 
 // ---------- the shared validation of a booking's table, time and party ----------
 
-const CHANGE_STRING_FIELDS = ['table_id', 'starts_at_local'] as const;
-
 interface Change {
-  table_id?: string;
+  table_ids?: string[];
   starts_at_local?: LocalDateTime;
   party_size?: number;
 }
 
 /** Reads the amendable fields: wrong JSON types first (400), then missing/invalid values (422). */
 function readChange(body: JsonObject, required: boolean): Change {
-  assertStringTyped(body, CHANGE_STRING_FIELDS);
-  const table_id = stringField(body, 'table_id', required);
+  assertTableSetTyped(body);
+  assertStringTyped(body, ['starts_at_local']);
+  const table_ids = tableSetField(body, required);
   const startsAtLocal = stringField(body, 'starts_at_local', required);
   const party_size = partySizeField(body, required);
   return {
-    table_id,
+    table_ids,
     party_size,
     starts_at_local: startsAtLocal === undefined ? undefined : parseStartsAtLocal(startsAtLocal),
   };
 }
 
-type Booking = Timing & { table_id: string; party_size: number };
+type Booking = Timing & { table_ids: string[]; party_size: number };
 
-/** Table, then time (existence, hours, grid), then capacity, as for POST /reservations. */
-function resolveBooking(restaurant: Restaurant, tableId: string, local: LocalDateTime, partySize: number): Booking {
-  const table = restaurant.tables.find((t) => t.id === tableId);
-  if (!table) throw notFound('No such table at this restaurant');
-  const timing = bookingTiming(restaurant, local);
-  if (partySize > table.capacity) {
-    throw unprocessable('party_exceeds_capacity', 'party_size exceeds the table\'s capacity');
+/**
+ * Tables (each known, a pair only if declared), then time (existence, hours, grid), then
+ * capacity summed over the set, as for POST /reservations. A pair is kept in `combinable` order.
+ */
+function resolveBooking(restaurant: Restaurant, tableIds: string[], local: LocalDateTime, partySize: number): Booking {
+  const tables = tableIds.map((id) => restaurant.tables.find((t) => t.id === id));
+  if (tables.some((t) => t === undefined)) throw notFound('No such table at this restaurant');
+  let ids = tableIds;
+  if (tableIds.length === 2) {
+    const pair = declaredPair(restaurant, tableIds[0], tableIds[1]);
+    if (!pair) throw unprocessable('combination_not_allowed', 'Those tables cannot be combined');
+    ids = [...pair];
   }
-  return { ...timing, table_id: tableId, party_size: partySize };
+  const timing = bookingTiming(restaurant, local);
+  const capacity = tables.reduce((sum, t) => sum + t!.capacity, 0);
+  if (partySize > capacity) {
+    throw unprocessable('party_exceeds_capacity', 'party_size exceeds the capacity of the chosen tables');
+  }
+  return { ...timing, table_ids: ids, party_size: partySize };
 }
 
 const tableUnavailable = () => conflict('table_unavailable', 'The table is taken for an overlapping time');
 
 /** 409 when `booking` overlaps a confirmed reservation other than those in `exclude`. */
 function assertFree(restaurantId: string, booking: Occupancy, exclude: ReadonlySet<string>): void {
-  const clashes = selectOverlapping.all(restaurantId, booking.table_id, booking.end_ms, booking.start_ms) as { id: string }[];
-  if (clashes.some((c) => !exclude.has(c.id))) throw tableUnavailable();
+  const clashes = selectOverlapping.all(restaurantId, booking.end_ms, booking.start_ms) as
+    (Omit<Occupancy, 'table_ids'> & { id: string; table_ids: string })[];
+  if (clashes.some((c) => !exclude.has(c.id) && overlaps(booking, { ...c, table_ids: readHold(c) }))) {
+    throw tableUnavailable();
+  }
 }
 
 // ---------- endpoints ----------
 
 export function createReservation(userId: string, body: JsonObject): Outcome {
-  assertStringTyped(body, ['restaurant_id', ...CHANGE_STRING_FIELDS]);
+  assertTableSetTyped(body);
+  assertStringTyped(body, ['restaurant_id', 'starts_at_local']);
   const restaurantId = stringField(body, 'restaurant_id', true)!;
   const change = readChange(body, true);
   const restaurant = findRestaurant(restaurantId);
   if (!restaurant) throw notFound('No such restaurant');
-  const booking = resolveBooking(restaurant, change.table_id!, change.starts_at_local!, change.party_size!);
+  const booking = resolveBooking(restaurant, change.table_ids!, change.starts_at_local!, change.party_size!);
   assertFree(restaurant.id, booking, new Set());
   const row: ReservationRow = {
     id: newId('res'),
@@ -124,12 +145,12 @@ export function createReservation(userId: string, body: JsonObject): Outcome {
     created_at: formatUtcNow(),
     ...booking,
   };
-  insertReservation.run(row);
+  insertReservation(row);
   return { status: 201, body: view(row) };
 }
 
 export function listReservations(userId: string): Outcome {
-  const rows = selectByUser.all(userId) as ReservationRow[];
+  const rows = selectByUser.all(userId).map(fromDbRow);
   return { status: 200, body: { reservations: rows.map(view) } };
 }
 
@@ -141,11 +162,13 @@ const cutoffError = () =>
   conflict('cutoff_passed', 'The booking is within its cancellation cutoff and can no longer change');
 
 export function cancelReservation(userId: string, reference: string): Outcome {
-  const row = ownReservation(userId, reference);
-  if (row.status === 'cancelled') return { status: 200, body: view(row) };
-  if (cutoffPassed(findRestaurant(row.restaurant_id)!, row.start_ms)) throw cutoffError();
-  updateStatus.run('cancelled', row.id);
-  return { status: 200, body: view({ ...row, status: 'cancelled' }) };
+  return inTransaction(() => {
+    const row = ownReservation(userId, reference);
+    if (row.status === 'cancelled') return { status: 200, body: view(row) };
+    if (cutoffPassed(findRestaurant(row.restaurant_id)!, row.start_ms)) throw cutoffError();
+    updateStatus.run('cancelled', row.id);
+    return { status: 200, body: view({ ...row, status: 'cancelled' }) };
+  });
 }
 
 /**
@@ -158,12 +181,12 @@ function planAmendment(row: ReservationRow, body: JsonObject): ReservationRow {
   const restaurant = findRestaurant(row.restaurant_id)!;
   if (cutoffPassed(restaurant, row.start_ms)) throw cutoffError();
   const change = readChange(body, false);
-  if (change.table_id === undefined && change.starts_at_local === undefined && change.party_size === undefined) {
+  if (change.table_ids === undefined && change.starts_at_local === undefined && change.party_size === undefined) {
     return row;
   }
   const booking = resolveBooking(
     restaurant,
-    change.table_id ?? row.table_id,
+    change.table_ids ?? row.table_ids,
     change.starts_at_local ?? parseLocalDateTime(row.starts_at_local)!,
     change.party_size ?? row.party_size,
   );
@@ -171,10 +194,12 @@ function planAmendment(row: ReservationRow, body: JsonObject): ReservationRow {
 }
 
 export function amendReservation(userId: string, reference: string, body: JsonObject): Outcome {
-  const planned = planAmendment(ownReservation(userId, reference), body);
-  assertFree(planned.restaurant_id, planned, new Set([planned.id]));
-  updateBooking.run(planned);
-  return { status: 200, body: view(planned) };
+  return inTransaction(() => {
+    const planned = planAmendment(ownReservation(userId, reference), body);
+    assertFree(planned.restaurant_id, planned, new Set([planned.id]));
+    updateBooking(planned);
+    return { status: 200, body: view(planned) };
+  });
 }
 
 /** Validates the batch's shape: 1..8 objects with distinct string references. */
@@ -212,6 +237,6 @@ export function moveReservations(userId: string, body: JsonObject): Outcome {
     if (planned.some((q, j) => j !== i && overlaps(p, q))) throw tableUnavailable();
     assertFree(p.restaurant_id, p, listed);
   });
-  for (const p of planned) updateBooking.run(p);
+  for (const p of planned) updateBooking(p);
   return { status: 201, body: { reservations: planned.map(view) } };
 }
