@@ -1,0 +1,174 @@
+// HTTP wiring: routes, request decoding and the error envelope. Rules live in the modules
+// each route calls; this file only decides the order of request-level checks.
+import express, { type NextFunction, type Request, type Response } from 'express';
+import { authenticate, login, signup } from './auth';
+import {
+  API_BODY_LIMIT, EXPORT_FORMAT_VERSION, EXPORT_TRACK, PATH_MOVES, PATH_RESERVATIONS, TEST_BODY_LIMIT,
+} from './constants';
+import { ApiError, malformed, notFound, validationFailed } from './errors';
+import { stateFromFixture } from './fixture';
+import { idempotencyKey, idempotent, type Outcome } from './idempotency';
+import {
+  amendReservation, cancelReservation, createReservation, getReservation, listReservations,
+  moveReservations, occupancyOf,
+} from './reservations';
+import { slotsOn } from './schedule';
+import { isObject, type JsonObject } from './shape';
+import { deserializeState, findRestaurant, listRestaurants, replaceState, serializeState, snapshotState } from './state';
+import { formatDate, parseDate } from './time';
+
+const PLAIN_DIGITS = /^\d+$/;
+
+/** The request body as a JSON object: unparseable or non-object bodies are 400. */
+function jsonBody(req: Request): JsonObject {
+  const text = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : '';
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw malformed('The request body is not valid JSON');
+  }
+  if (!isObject(value)) throw malformed('The request body must be a JSON object');
+  return value;
+}
+
+const userOf = (req: Request) => authenticate(req.get('authorization'));
+
+function send(res: Response, outcome: Outcome): void {
+  if (outcome.status === 204) res.status(204).end();
+  else res.status(outcome.status).json(outcome.body);
+}
+
+function sendError(res: Response, err: unknown): void {
+  if (err instanceof ApiError) {
+    res.status(err.status).json(err.toBody());
+    return;
+  }
+  console.error(err);
+  res.status(500).json({ error: { code: 'internal_error', message: 'Unexpected error' } });
+}
+
+type Handler = (req: Request) => Outcome | Promise<Outcome>;
+
+const route = (handler: Handler) => async (req: Request, res: Response) => {
+  try {
+    send(res, await handler(req));
+  } catch (err) {
+    sendError(res, err);
+  }
+};
+
+const ok = (body: unknown): Outcome => ({ status: 200, body });
+const NO_CONTENT: Outcome = { status: 204, body: undefined };
+
+// ---------- availability query (§5 query integers, §8) ----------
+
+function availability(req: Request): Outcome {
+  const params = new URL(req.originalUrl, 'http://localhost').searchParams;
+  const value = (name: string) => {
+    const v = params.get(name);
+    if (v === null || v === '') throw validationFailed(`${name} is required`);
+    return v;
+  };
+  const restaurantId = value('restaurant_id');
+  const date = parseDate(value('date'));
+  if (!date) throw validationFailed('date must be a calendar date YYYY-MM-DD');
+  const party = value('party_size');
+  if (!PLAIN_DIGITS.test(party) || Number(party) < 1) {
+    throw validationFailed('party_size must be a positive integer written as plain decimal digits');
+  }
+  const restaurant = findRestaurant(restaurantId);
+  if (!restaurant) throw notFound('No such restaurant');
+  return ok({
+    restaurant_id: restaurant.id,
+    date: formatDate(date),
+    timezone: restaurant.timezone,
+    slots: slotsOn(restaurant, date, Number(party), occupancyOf(restaurant.id)),
+  });
+}
+
+// ---------- test control (§3.3, §10) ----------
+
+async function reset(req: Request): Promise<Outcome> {
+  replaceState(await stateFromFixture(jsonBody(req)));
+  return NO_CONTENT;
+}
+
+function exportAll(): Outcome {
+  return ok({ track: EXPORT_TRACK, format_version: EXPORT_FORMAT_VERSION, state: serializeState(snapshotState()) });
+}
+
+function importAll(req: Request): Outcome {
+  const body = jsonBody(req);
+  if (body.track !== EXPORT_TRACK) throw validationFailed(`track must be "${EXPORT_TRACK}"`);
+  if (body.format_version !== EXPORT_FORMAT_VERSION) {
+    throw validationFailed(`format_version must be ${EXPORT_FORMAT_VERSION}`);
+  }
+  replaceState(deserializeState(body.state));
+  return NO_CONTENT;
+}
+
+// ---------- idempotent writes (§7): auth, body, key, then the idempotency record ----------
+
+function idempotentWrite(path: string, run: (userId: string, body: JsonObject) => Outcome): Handler {
+  return (req) => {
+    const userId = userOf(req);
+    const body = jsonBody(req);
+    const key = idempotencyKey(req.get('idempotency-key'));
+    return idempotent(userId, path, key, body, () => run(userId, body));
+  };
+}
+
+const param = (req: Request, name: string) => String(req.params[name]);
+
+export function createApp(): express.Express {
+  const app = express();
+  app.disable('x-powered-by');
+  app.set('etag', false);
+
+  const anyBody = (limit: string) => express.raw({ type: () => true, limit });
+  app.use('/_test', anyBody(TEST_BODY_LIMIT));
+  app.use(anyBody(API_BODY_LIMIT));
+
+  app.get('/health', route(() => ok({ status: 'ok' })));
+  app.post('/_test/reset', route(reset));
+  app.get('/_test/export', route(exportAll));
+  app.post('/_test/import', route(importAll));
+
+  app.post('/auth/signup', route(async (req) => ({ status: 201, body: await signup(jsonBody(req)) })));
+  app.post('/auth/login', route(async (req) => ok(await login(jsonBody(req)))));
+
+  app.get('/restaurants', route(() =>
+    ok({ restaurants: listRestaurants().map(({ id, name, timezone }) => ({ id, name, timezone })) })));
+  app.get('/restaurants/:id', route((req) => {
+    const restaurant = findRestaurant(param(req, 'id'));
+    if (!restaurant) throw notFound('No such restaurant');
+    return ok(restaurant);
+  }));
+  app.get('/availability', route(availability));
+
+  app.post(PATH_RESERVATIONS, route(idempotentWrite(PATH_RESERVATIONS, createReservation)));
+  app.get('/reservations', route((req) => listReservations(userOf(req))));
+  app.get('/reservations/:reference', route((req) => getReservation(userOf(req), param(req, 'reference'))));
+  app.post('/reservations/:reference/cancel', route((req) =>
+    cancelReservation(userOf(req), param(req, 'reference'))));
+  app.patch('/reservations/:reference', route((req) => {
+    const userId = userOf(req);
+    return amendReservation(userId, param(req, 'reference'), jsonBody(req));
+  }));
+  app.post(PATH_MOVES, route(idempotentWrite(PATH_MOVES, moveReservations)));
+
+  app.use(route(() => {
+    throw notFound('No such endpoint');
+  }));
+
+  // Body-reading failures (oversized, aborted, bad encoding) still answer with the envelope.
+  app.use((err: { status?: number; type?: string }, _req: Request, res: Response, _next: NextFunction) => {
+    if (err.type === 'entity.too.large') {
+      res.status(413).json(new ApiError(413, 'payload_too_large', 'The request body is too large').toBody());
+    } else {
+      sendError(res, err.status && err.status < 500 ? malformed('The request body could not be read') : err);
+    }
+  });
+  return app;
+}

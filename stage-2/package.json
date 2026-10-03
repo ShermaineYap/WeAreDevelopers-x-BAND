@@ -1,0 +1,30 @@
+{
+  "name": "tablekeeper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tablekeeper restaurant reservation service (stage 1: HTTP API)",
+  "type": "commonjs",
+  "main": "dist/server.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "test:acceptance": "node --test --test-concurrency=1 tests/acceptance/*.test.mjs"
+  },
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "better-sqlite3": "^12.4.1",
+    "express": "^5.1.0",
+    "luxon": "^3.7.2"
+  },
+  "devDependencies": {
+    "@types/bcrypt": "^6.0.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.3",
+    "@types/luxon": "^3.7.1",
+    "@types/node": "^22.18.0",
+    "typescript": "^5.9.2"
+  }
+}
