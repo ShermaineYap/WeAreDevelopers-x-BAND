@@ -132,6 +132,7 @@
 | S3-100 | The stage-2 grid follows the selected policy (slots, capacities, `data-available`) | not covered | browser/policies-ui: S3-100 |
 | S3-101 | After writes (policy publication, amendment, cancel), screens re-read the server: a new search and lookup show the current state | not covered | browser/policies-ui: S3-101 |
 | S3-102 | No new screens; stage-2 screens and API keep working (regression) | not covered | all carried stage-1/2 suites |
+| S3-103 | A day closed by the selected policy is labelled "closed" in the grid, like a fixture-closed day (brief: causes in human words; "decisions use the selected policy") | not covered | browser/policy-closed: S3-103 |
 
 ## Stage-1 and stage-2 statements that stage 3 changes or extends
 
@@ -155,7 +156,7 @@
 **Not covered:** S3-001, 006, 007, 008, 010, 011, 015, 016, 017, 018, 021, 023, 024, 025, 026, 028, 030,
 031, 032, 040, 041, 042, 043, 044, 045, 046, 047, 048, 050, 051, 052, 055, 056, 057, 058, 059, 060,
 061, 062, 063, 064, 065, 066, 070, 071, 080, 081, 082, 083, 084, 090, 091, 092, 093, 094, 095, 096,
-100, 101, 102.
+100, 101, 102, 103.
 
 **Partial:** S3-003, 004, 005, 012, 014, 020, 022, 027, 029, 033, 053, 054.
 
