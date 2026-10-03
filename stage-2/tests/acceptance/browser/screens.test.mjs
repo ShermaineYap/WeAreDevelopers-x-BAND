@@ -213,6 +213,7 @@ test('S2-073 pages load nothing from outside the service', async () => {
     await logIn(page);
     await search(page, { date: THU, party: 2, readyCell: 'slot-t_2-19:00' });
     await page.click(sel('slot-t_2-19:00'));
+    await page.waitForSelector(sel('booking-form'));
     await page.click(sel('booking-submit'));
     await page.waitForSelector(sel('confirmation'));
     await page.waitForLoadState('networkidle');
