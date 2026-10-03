@@ -105,9 +105,10 @@ export function getSeries(userId: string | null, seriesId: string): Outcome {
 /**
  * POST /series/{id}/amend (stage 4, inside the idempotency transaction): moves every eligible
  * occurrence (index >= from_index, confirmed, not an exception) to `local_time` on its own
- * date, with PATCH semantics per occurrence but without marking exceptions. Errors: input 422,
- * not yours 404, stale series revision 409 before anything else, then each occurrence's
- * non-occupancy errors in index order, then occupancy. The series and restaurant revisions
+ * date, with PATCH semantics per real change but without marking exceptions; unchanged
+ * occurrences are no-ops and face no checks. Errors: input 422, not yours 404, stale series
+ * revision 409 before anything else, then each changing occurrence's non-occupancy errors in
+ * index order, then occupancy. The series and restaurant revisions
  * move once if anything changed.
  */
 export function amendSeries(userId: string, seriesId: string, body: JsonObject): Outcome {
@@ -121,10 +122,13 @@ export function amendSeries(userId: string, seriesId: string, body: JsonObject):
   const occurrences = occurrencesOf(series);
   if (fromIndex >= occurrences.length) throw validationFailed(`from_index must be below ${occurrences.length}`);
   if (expected !== series.revision) throw conflict('stale_revision', `The series is at revision ${series.revision}`);
-  const plans = occurrences
+  // Only real changes face the PATCH checks (old accepted cutoff, then the resulting date's
+  // policy): an occurrence already at `localTime` is a no-op even when past its cutoff.
+  const changed = occurrences
     .filter((o) => o.series_index! >= fromIndex && o.status === 'confirmed' && !o.exception)
-    .map((o) => planAmendment(o, { starts_at_local: `${o.starts_at_local.slice(0, 10)}T${localTime}` }, { markException: false }));
-  const changed = plans.filter((p) => p.changed);
+    .map((o) => ({ occurrence: o, startsAtLocal: `${o.starts_at_local.slice(0, 10)}T${localTime}` }))
+    .filter(({ occurrence, startsAtLocal }) => startsAtLocal !== occurrence.starts_at_local)
+    .map(({ occurrence, startsAtLocal }) => planAmendment(occurrence, { starts_at_local: startsAtLocal }, { markException: false }));
   const moving = new Set(changed.map((p) => p.after.id));
   changed.forEach((p, i) => {
     if (changed.some((q, j) => j !== i && overlaps(p.after, q.after))) throw tableUnavailable();
