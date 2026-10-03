@@ -1,9 +1,10 @@
-# Tablekeeper — stage 3
+# Tablekeeper — stage 4
 
 HTTP API plus browser screens for restaurant availability, bookings (single tables and
 declared combinable pairs), cancellations, amendments and atomic multi-booking moves; dated
 booking policies with accepted terms and revisions, availability explanations, reservation
-history and recurring reservations (series).
+history and recurring reservations (series); seating changes after a table closure (replan
+previews and atomic plan application) and recurring-reservation amendments.
 Node 22 + TypeScript, Express, an in-memory `better-sqlite3` store, `luxon` for time zones
 and `bcrypt` for password hashing. State is ephemeral.
 
@@ -13,11 +14,11 @@ all served from the image (`/assets/...`); pages make no requests outside the se
 
 ## Build and run
 
-From this folder (`stage-3/`):
+From this folder (`stage-4/`):
 
 ```sh
-docker build -t tablekeeper-stage-3 .
-docker run --rm -p 8080:8080 -e PORT=8080 tablekeeper-stage-3
+docker build -t tablekeeper-stage-4 .
+docker run --rm -p 8080:8080 -e PORT=8080 tablekeeper-stage-4
 ```
 
 Open http://localhost:8080/ in a browser.
@@ -31,13 +32,14 @@ The service listens on `0.0.0.0:$PORT` (default `8080`) and needs no network at 
 With the service running on port 8080, from the repository root:
 
 ```sh
-# API (stage-1 and stage-2 regression + stage-3)
-BASE_URL=http://localhost:8080 node --test --test-concurrency=1 stage-3/tests/acceptance/*.test.mjs
-# Browser (one-time: npm --prefix stage-3/tests/acceptance ci)
-BASE_URL=http://localhost:8080 node --test --test-concurrency=1 stage-3/tests/acceptance/browser/*.test.mjs
-# Upgrades: run the stage-2 image on 8081 and the stage-1 image on 8082, and add
-#   PREVIOUS_BASE_URL=http://localhost:8081 PREVIOUS_STAGE1_BASE_URL=http://localhost:8082
-# to the API command.
+# API (stage-1..3 regression + stage-4)
+BASE_URL=http://localhost:8080 node --test --test-concurrency=1 stage-4/tests/acceptance/*.test.mjs
+# Browser (one-time: npm --prefix stage-4/tests/acceptance ci)
+BASE_URL=http://localhost:8080 node --test --test-concurrency=1 stage-4/tests/acceptance/browser/*.test.mjs
+# Upgrades: run the stage-3, stage-2 and stage-1 images (built from their folders) on 8083,
+# 8082 and 8081, and add to the API command:
+#   PREVIOUS_BASE_URL=http://localhost:8083 PREVIOUS_STAGE2_BASE_URL=http://localhost:8082 \
+#   PREVIOUS_STAGE1_BASE_URL=http://localhost:8081
 ```
 
 ## Layout
@@ -62,7 +64,8 @@ BASE_URL=http://localhost:8080 node --test --test-concurrency=1 stage-3/tests/ac
 | `src/terms.ts`, `src/hours.ts` | Booking rules: policy 0, accepted terms, policy and opening-hours validation |
 | `src/policies.ts` | Policy publication, the public list, and policy selection by local start date |
 | `src/history.ts` | Reservation history entries and change computation |
-| `src/series.ts` | Recurring reservations: adoption and reads |
+| `src/series.ts` | Recurring reservations: adoption, reads and amendment |
+| `src/replans.ts` | Closure replans: exhaustive seating search, preview, atomic apply, public closures |
 | `src/fields.ts` | Request field reading: wrong type 400, missing/invalid 422, table sets |
 | `src/db.ts` | SQLite schema and the transaction helper |
 
@@ -113,6 +116,33 @@ BASE_URL=http://localhost:8080 node --test --test-concurrency=1 stage-3/tests/ac
   amendment, cancellation, policy publication, series adoption and changing move batch.
 - Bookings seeded by a fixture or imported from stage-1/stage-2 exports get revision 1, policy-0
   terms and a synthesised `created` (and `cancelled`) history entry at their creation time.
+- Stage 4 replans: considered bookings are every confirmed booking at the restaurant whose
+  interval overlaps `[from, to)`, on any table; the rest are fixed. The planner tries every
+  single and declared pair for each considered booking (capacity under its own accepted
+  terms, no clash with fixed bookings, applied closures or the proposed closure, nor with each
+  other) and keeps the lexicographic best of (bookings whose table set changes, unused seats,
+  option ranks in reference order), with a bound that prunes partial plans already worse on
+  the first two. Beyond 6 tables, 4 pairs or 6 considered bookings it still plans exactly
+  unless the search space exceeds 5,000,000 combinations (then 422 `planning_limit`).
+- Preview: auth, body, key, idempotency, unknown restaurant 404, non-manager 403, missing or
+  invalid fields 422 (instants need an explicit offset, `Z` included; `from < to`), unknown
+  table 404, then the plan (409 `no_feasible_plan`). Only the plan is stored.
+- Apply: unknown plan or another restaurant's 404, already applied 409 `plan_already_applied`
+  (before staleness), restaurant revision moved since the preview 409 `stale_plan`. Moved
+  bookings gain one revision and one `reassigned` history entry (`table_ids` change, `plan_id`);
+  the closure is recorded; each affected series and the restaurant gain one revision.
+- Applied closures hold their table like a booking: availability, explain (`no_overlap`
+  false), creates, amendments, moves, series and later plans all respect them.
+  `GET /restaurants/{id}/closures` (public, additive) lists them so screens can say "closed".
+- Series amendment: input 422 (expected_revision positive integer, from_index integer below
+  the occurrence count, local_time HH:MM), not yours 404, stale series revision 409, then each
+  eligible occurrence (index ≥ from_index, confirmed, not an exception) with PATCH semantics
+  on its own date in index order, then occupancy. No exceptions are marked.
+- Restaurant revision (`restaurant_revision` in plans): +1 per new booking, real amendment,
+  first cancel, policy publication, series adoption, changing move batch, changing series
+  amendment and plan application; never for seeds, previews, no-ops, failures or replays.
+- UI: a table taken out of service by an applied closure reads "Closed" (solid dark cell),
+  distinct from booked (hatched, struck through), too small (dashed) and available.
 - UI: the grid asks for `explain=true`, so a table that cannot fit the party under the date's
   policy is labelled "Too small". Seat counts and the closed-day message come from the policy
   that applies to the searched date (selected from the public `GET /restaurants/{id}/policies`

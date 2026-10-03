@@ -77,18 +77,20 @@ async function runSearch(query, { refresh = false } = {}) {
   let availability;
   let restaurant;
   let policies;
+  let closures;
   try {
-    [availability, restaurant, policies] = await Promise.all([
+    [availability, restaurant, policies, closures] = await Promise.all([
       api('GET', `/availability?${params}`),
       api('GET', restaurantPath),
       api('GET', `${restaurantPath}/policies`),
+      api('GET', `${restaurantPath}/closures`),
     ]);
   } catch {
     if (seq === state.seq) showSearchProblem('We could not reach the restaurant. Check your connection and try again.');
     return;
   }
   if (seq !== state.seq) return; // a newer search owns the screen
-  const failed = [availability, restaurant, policies].find((r) => r.status !== 200);
+  const failed = [availability, restaurant, policies, closures].find((r) => r.status !== 200);
   if (failed) {
     showSearchProblem(errorMessage(failed, 'Those tables could not be loaded. Please try again.'));
     return;
@@ -96,6 +98,7 @@ async function runSearch(query, { refresh = false } = {}) {
   state.shown = {
     query, restaurant: restaurant.body, availability: availability.body,
     rules: rulesOn(restaurant.body, policies.body.policies, query.date),
+    closures: closures.body.closures.map((c) => ({ tableId: c.table_id, from: Date.parse(c.from), to: Date.parse(c.to) })),
   };
   renderGrid();
 }
@@ -125,10 +128,11 @@ function rulesOn(restaurant, policies, date) {
     .filter((p) => p.effective_from <= date)
     .sort((a, b) => (a.effective_from === b.effective_from
       ? b.policy_version - a.policy_version : b.effective_from.localeCompare(a.effective_from)))[0];
-  if (applicable) return { opening_hours: applicable.opening_hours, capacities: applicable.capacities };
+  const source = applicable || restaurant;
   return {
-    opening_hours: restaurant.opening_hours,
-    capacities: Object.fromEntries(restaurant.tables.map((t) => [t.id, t.capacity])),
+    opening_hours: source.opening_hours,
+    duration_minutes: source.reservation_duration_minutes,
+    capacities: applicable ? applicable.capacities : Object.fromEntries(restaurant.tables.map((t) => [t.id, t.capacity])),
   };
 }
 
@@ -139,7 +143,14 @@ function refreshGrid() {
 
 // ---------- grid ----------
 
-const CAUSE_TEXT = { available: 'Available', booked: 'Booked', small: 'Too small' };
+const CAUSE_TEXT = { available: 'Available', booked: 'Booked', small: 'Too small', closed: 'Closed' };
+
+/** True when an applied closure (stage 4) takes `tableId` out of service during the slot. */
+function closedDuring(closures, tableId, slot, durationMinutes) {
+  const start = Date.parse(slot.starts_at);
+  const end = start + durationMinutes * 60_000;
+  return closures.some((c) => c.tableId === tableId && c.from < end && start < c.to);
+}
 
 /** One seating cell: its tables, seats under the date's rules, and why it is (un)available. */
 function cell({ restaurant, tableIds, startsAtLocal, capacity, cause }) {
@@ -165,7 +176,7 @@ function cell({ restaurant, tableIds, startsAtLocal, capacity, cause }) {
 }
 
 function renderGrid() {
-  const { query, restaurant, availability, rules } = state.shown;
+  const { query, restaurant, availability, rules, closures } = state.shown;
   results.removeAttribute('aria-busy');
   const day = formatDay(query.date);
   if (availability.slots.length === 0) {
@@ -184,7 +195,10 @@ function renderGrid() {
     const singles = restaurant.tables.map((table) => {
       const reason = (slot.explain || []).find((e) => e.table_id === table.id);
       const tooSmall = reason ? !reason.rules[0].holds : false;
-      const cause = slot.available_table_ids.includes(table.id) ? 'available' : tooSmall ? 'small' : 'booked';
+      // A table out of service is "closed" whatever else holds; then too small; else booked.
+      const cause = slot.available_table_ids.includes(table.id) ? 'available'
+        : closedDuring(closures, table.id, slot, rules.duration_minutes) ? 'closed'
+          : tooSmall ? 'small' : 'booked';
       return cell({ restaurant, tableIds: [table.id], startsAtLocal: slot.starts_at_local, capacity: rules.capacities[table.id], cause });
     });
     // Combined seatings appear only when the declared pair is free for this party.
@@ -206,7 +220,8 @@ function renderGrid() {
       el('li', {}, el('span', { class: 'swatch swatch--available' }), 'Available'),
       el('li', {}, el('span', { class: 'swatch swatch--selected' }), 'Your choice'),
       el('li', {}, el('span', { class: 'swatch swatch--booked' }), 'Booked'),
-      el('li', {}, el('span', { class: 'swatch swatch--small' }), 'Too small for your party')),
+      el('li', {}, el('span', { class: 'swatch swatch--small' }), 'Too small for your party'),
+      el('li', {}, el('span', { class: 'swatch swatch--closed' }), 'Closed')),
     el('ol', { class: 'slots' }, rows)));
   renderPanel();
 }
