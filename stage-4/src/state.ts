@@ -2,7 +2,7 @@
 // exported. Reset, import and export all go through replaceState/snapshotState, so there is
 // one definition of "all state".
 import {
-  REFERENCE_PATTERN, STAGE1_STATE_SCHEMA, STAGE2_STATE_SCHEMA, STATE_SCHEMA,
+  REFERENCE_PATTERN, STAGE1_STATE_SCHEMA, STAGE2_STATE_SCHEMA, STAGE3_STATE_SCHEMA, STATE_SCHEMA,
 } from './constants';
 import { db, inTransaction } from './db';
 import { validationFailed } from './errors';
@@ -77,8 +77,8 @@ export interface ReservationRow {
   exception: boolean;
 }
 
-export type HistoryEvent = 'created' | 'changed' | 'cancelled';
-export const HISTORY_EVENTS: readonly string[] = ['created', 'changed', 'cancelled'];
+export type HistoryEvent = 'created' | 'changed' | 'cancelled' | 'reassigned';
+export const HISTORY_EVENTS: readonly string[] = ['created', 'changed', 'cancelled', 'reassigned'];
 
 export interface Change {
   field: string;
@@ -94,6 +94,40 @@ export interface HistoryRow {
   changes: Change[];
   revision: number;
   accepted_terms: Terms;
+  /** The plan that reassigned the booking (stage 4 `reassigned` entries only). */
+  plan_id: string | null;
+}
+
+/** One booking's place in a replan: its table set and whether that set changes. */
+export interface Assignment {
+  reference: string;
+  table_ids: string[];
+  changed: boolean;
+}
+
+/** A previewed seating plan for a proposed closure (stage 4). */
+export interface PlanRow {
+  id: string;
+  restaurant_id: string;
+  restaurant_revision: number;
+  table_id: string;
+  closure_from: string;
+  closure_to: string;
+  from_ms: number;
+  to_ms: number;
+  assignments: Assignment[];
+  moved_count: number;
+  unused_seats: number;
+  applied: boolean;
+}
+
+/** An applied closure: the table is unavailable over [from_ms, to_ms). */
+export interface ClosureRow {
+  restaurant_id: string;
+  table_id: string;
+  from_ms: number;
+  to_ms: number;
+  plan_id: string;
 }
 
 export interface SeriesRow {
@@ -124,6 +158,8 @@ export interface StoreState {
   reservations: ReservationRow[];
   history: HistoryRow[];
   series: SeriesRow[];
+  plans: PlanRow[];
+  closures: ClosureRow[];
   idempotency: IdempotencyRow[];
 }
 
@@ -229,6 +265,13 @@ export function bumpRestaurantRevision(restaurantId: string): void {
   bumpRevisionStmt.run(restaurantId);
 }
 
+const selectRevision = db.prepare('SELECT revision FROM restaurants WHERE id = ?');
+
+/** The restaurant revision: 0 after reset, +1 per counted write (stage 4). */
+export function restaurantRevision(restaurantId: string): number {
+  return (selectRevision.get(restaurantId) as { revision: number }).revision;
+}
+
 // ---------- reservation rows ----------
 
 /** Column list matching ReservationDbRow; JSON columns hold table_ids and accepted_terms. */
@@ -285,8 +328,23 @@ export const insertPolicy = db.prepare(
    VALUES (@restaurant_id, @policy_version, @effective_from, @slot_minutes,
            @reservation_duration_minutes, @cancellation_cutoff_minutes, @opening_hours, @capacities)`);
 export const insertHistory = db.prepare(
-  `INSERT INTO history (reservation_id, seq, at, event, changes, revision, accepted_terms)
-   VALUES (@reservation_id, @seq, @at, @event, @changes, @revision, @accepted_terms)`);
+  `INSERT INTO history (reservation_id, seq, at, event, changes, revision, accepted_terms, plan_id)
+   VALUES (@reservation_id, @seq, @at, @event, @changes, @revision, @accepted_terms, @plan_id)`);
+const PLAN_COLUMNS = `id, restaurant_id, restaurant_revision, table_id, closure_from, closure_to, from_ms, to_ms,
+  assignments, moved_count, unused_seats, applied`;
+export const insertPlan = db.prepare(
+  `INSERT INTO plans (${PLAN_COLUMNS})
+   VALUES (@id, @restaurant_id, @restaurant_revision, @table_id, @closure_from, @closure_to, @from_ms, @to_ms,
+           @assignments, @moved_count, @unused_seats, @applied)`);
+export const insertClosure = db.prepare(
+  `INSERT INTO closures (restaurant_id, table_id, from_ms, to_ms, plan_id)
+   VALUES (@restaurant_id, @table_id, @from_ms, @to_ms, @plan_id)`);
+export const planDbRow = (p: PlanRow) => ({ ...p, assignments: JSON.stringify(p.assignments), applied: p.applied ? 1 : 0 });
+export const planFromDb = (r: unknown): PlanRow => {
+  const row = r as Omit<PlanRow, 'assignments' | 'applied'> & { assignments: string; applied: number };
+  return { ...row, assignments: JSON.parse(row.assignments) as Assignment[], applied: row.applied === 1 };
+};
+export const selectPlanStmt = db.prepare(`SELECT ${PLAN_COLUMNS} FROM plans WHERE id = ?`);
 export const insertSeries = db.prepare(
   `INSERT INTO series (id, user_id, restaurant_id, interval_weeks, revision)
    VALUES (@id, @user_id, @restaurant_id, @interval_weeks, @revision)`);
@@ -295,7 +353,7 @@ const insertIdempotency = db.prepare(
    VALUES (@user_id, @path, @key, @request_hash, @response)`);
 
 const ALL_TABLES = ['users', 'tokens', 'restaurants', 'restaurant_tables', 'policies', 'reservations',
-  'history', 'series', 'idempotency'];
+  'history', 'series', 'plans', 'closures', 'idempotency'];
 
 export const policyDbRow = (p: PolicyRow) => ({
   ...p, opening_hours: JSON.stringify(p.opening_hours), capacities: JSON.stringify(p.capacities),
@@ -329,6 +387,8 @@ export function replaceState(state: StoreState): void {
       for (const r of state.reservations) insertReservation(r);
       for (const h of state.history) insertHistory.run(historyDbRow(h));
       for (const s of state.series) insertSeries.run(s);
+      for (const p of state.plans) insertPlan.run(planDbRow(p));
+      for (const c of state.closures) insertClosure.run(c);
       for (const i of state.idempotency) insertIdempotency.run(i);
     });
   } catch (err) {
@@ -355,10 +415,12 @@ export function snapshotState(): StoreState {
       .map((p) => ({ ...p, opening_hours: JSON.parse(p.opening_hours), capacities: JSON.parse(p.capacities) })),
     reservations: db.prepare(`SELECT ${RESERVATION_COLUMNS} FROM reservations ORDER BY rowid`).all().map(fromDbRow),
     history: (db.prepare(
-      'SELECT reservation_id, seq, at, event, changes, revision, accepted_terms FROM history ORDER BY rowid').all() as
+      'SELECT reservation_id, seq, at, event, changes, revision, accepted_terms, plan_id FROM history ORDER BY rowid').all() as
       (Omit<HistoryRow, 'changes' | 'accepted_terms'> & { changes: string; accepted_terms: string })[])
       .map((h) => ({ ...h, changes: JSON.parse(h.changes), accepted_terms: JSON.parse(h.accepted_terms) })),
     series: db.prepare('SELECT id, user_id, restaurant_id, interval_weeks, revision FROM series ORDER BY rowid').all() as SeriesRow[],
+    plans: db.prepare(`SELECT ${PLAN_COLUMNS} FROM plans ORDER BY rowid`).all().map(planFromDb),
+    closures: db.prepare('SELECT restaurant_id, table_id, from_ms, to_ms, plan_id FROM closures ORDER BY rowid').all() as ClosureRow[],
     idempotency: db.prepare(
       'SELECT user_id, path, key, request_hash, response FROM idempotency ORDER BY rowid').all() as IdempotencyRow[],
   }));
@@ -384,7 +446,7 @@ function exportedTableIds(r: JsonObject, path: string, stage1: boolean): string[
  * current values, at its current revision and terms.
  */
 export function initialHistory(r: ReservationRow): HistoryRow[] {
-  const base = { reservation_id: r.id, at: r.created_at, revision: r.revision, accepted_terms: r.accepted_terms };
+  const base = { reservation_id: r.id, at: r.created_at, revision: r.revision, accepted_terms: r.accepted_terms, plan_id: null };
   const tables: Change = r.table_ids.length === 1
     ? { field: 'table_id', from: null, to: r.table_ids[0] }
     : { field: 'table_ids', from: null, to: r.table_ids };
@@ -406,10 +468,13 @@ function optionalId(r: JsonObject, name: string, path: string): string | null {
  */
 export function deserializeState(value: unknown): StoreState {
   const s = expectObject(value, 'state');
-  const known = [STATE_SCHEMA, STAGE1_STATE_SCHEMA, STAGE2_STATE_SCHEMA];
+  const known = [STATE_SCHEMA, STAGE1_STATE_SCHEMA, STAGE2_STATE_SCHEMA, STAGE3_STATE_SCHEMA];
   if (!known.includes(s.schema as string)) throw validationFailed('state was not produced by this service');
   const stage1 = s.schema === STAGE1_STATE_SCHEMA;
-  const legacy = s.schema !== STATE_SCHEMA;
+  /** Stage-1/2 exports: no policies, revisions, history or series. */
+  const legacy = s.schema === STAGE1_STATE_SCHEMA || s.schema === STAGE2_STATE_SCHEMA;
+  /** Stage-1..3 exports: no plans or closures. */
+  const beforePlans = s.schema !== STATE_SCHEMA;
   const users = expectArray(s.users, 'state.users').map((v, i) => {
     const p = `state.users[${i}]`; const u = expectObject(v, p);
     return { id: expectId(u, 'id', p), email: expectString(u, 'email', p),
@@ -503,8 +568,37 @@ export function deserializeState(value: unknown): StoreState {
       });
       return { reservation_id: owner.id, seq: expectInteger(o, 'seq', p, 1), at: expectString(o, 'at', p),
         event: event as HistoryEvent, changes, revision: expectInteger(o, 'revision', p, 1),
-        accepted_terms: parseTerms(o.accepted_terms, `${p}.accepted_terms`, restaurantOf(owner.restaurant_id, p)) };
+        accepted_terms: parseTerms(o.accepted_terms, `${p}.accepted_terms`, restaurantOf(owner.restaurant_id, p)),
+        plan_id: optionalId(o, 'plan_id', p) };
     });
+  const tableOf = (restaurantId: string, tableId: string, p: string) => {
+    if (!restaurantOf(restaurantId, p).tables.some((t) => t.id === tableId)) throw validationFailed(`${p} names an unknown table`);
+    return tableId;
+  };
+  const plans: PlanRow[] = beforePlans ? [] : expectArray(s.plans, 'state.plans').map((v, i) => {
+    const p = `state.plans[${i}]`; const o = expectObject(v, p);
+    const restaurantId = restaurantOf(expectString(o, 'restaurant_id', p), p).id;
+    const assignments = expectArray(o.assignments, `${p}.assignments`).map((a, j) => {
+      const q = `${p}.assignments[${j}]`; const x = expectObject(a, q);
+      const ids = expectArray(x.table_ids, `${q}.table_ids`);
+      if (ids.some((id) => typeof id !== 'string')) throw validationFailed(`${q}.table_ids must hold strings`);
+      return { reference: expectString(x, 'reference', q), table_ids: ids as string[], changed: x.changed === true };
+    });
+    return { id: expectId(o, 'id', p), restaurant_id: restaurantId,
+      restaurant_revision: expectInteger(o, 'restaurant_revision', p, 0),
+      table_id: tableOf(restaurantId, expectString(o, 'table_id', p), p),
+      closure_from: expectString(o, 'closure_from', p), closure_to: expectString(o, 'closure_to', p),
+      from_ms: expectInteger(o, 'from_ms', p, -8.64e15), to_ms: expectInteger(o, 'to_ms', p, -8.64e15),
+      assignments, moved_count: expectInteger(o, 'moved_count', p, 0), unused_seats: expectInteger(o, 'unused_seats', p, 0),
+      applied: o.applied === true };
+  });
+  const closures: ClosureRow[] = beforePlans ? [] : expectArray(s.closures, 'state.closures').map((v, i) => {
+    const p = `state.closures[${i}]`; const o = expectObject(v, p);
+    const restaurantId = restaurantOf(expectString(o, 'restaurant_id', p), p).id;
+    return { restaurant_id: restaurantId, table_id: tableOf(restaurantId, expectString(o, 'table_id', p), p),
+      from_ms: expectInteger(o, 'from_ms', p, -8.64e15), to_ms: expectInteger(o, 'to_ms', p, -8.64e15),
+      plan_id: expectString(o, 'plan_id', p) };
+  });
 
   const idempotency = expectArray(s.idempotency, 'state.idempotency').map((v, i) => {
     const p = `state.idempotency[${i}]`; const r = expectObject(v, p);
@@ -518,5 +612,7 @@ export function deserializeState(value: unknown): StoreState {
     }
     return row;
   });
-  return { users, tokens, restaurants, restaurant_revisions, policies, reservations, history, series, idempotency };
+  return {
+    users, tokens, restaurants, restaurant_revisions, policies, reservations, history, series, plans, closures, idempotency,
+  };
 }

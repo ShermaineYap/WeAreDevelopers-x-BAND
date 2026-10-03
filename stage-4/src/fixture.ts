@@ -135,6 +135,8 @@ export async function stateFromFixture(value: unknown): Promise<StoreState> {
     reservations,
     history: reservations.flatMap(initialHistory),
     series: [],
+    plans: [],
+    closures: [],
     idempotency: [],
   };
 }

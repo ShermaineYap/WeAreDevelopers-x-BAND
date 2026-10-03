@@ -5,7 +5,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import { authenticate, login, signup } from './auth';
 import {
   API_BODY_LIMIT, EXPORT_FORMAT_VERSION, EXPORT_TRACK, PATH_MOVES, PATH_RESERVATIONS, PATH_SERIES,
-  TEST_BODY_LIMIT, policiesPath,
+  TEST_BODY_LIMIT, applyPath, policiesPath, replansPath, seriesAmendPath,
 } from './constants';
 import { ApiError, malformed, notFound, validationFailed } from './errors';
 import { stateFromFixture } from './fixture';
@@ -15,7 +15,8 @@ import {
   amendReservation, cancelReservation, createReservation, getDecision, getHistory, getReservation,
   listReservations, moveReservations, occupancyOf,
 } from './reservations';
-import { adoptSeries, getSeries } from './series';
+import { applyReplan, listClosures, previewReplan } from './replans';
+import { adoptSeries, amendSeries, getSeries } from './series';
 import { renderPage, SCREEN_ROUTES } from './pages';
 import { slotsOn } from './schedule';
 import { isObject, type JsonObject } from './shape';
@@ -181,6 +182,17 @@ export function createApp(): express.Express {
   app.post('/restaurants/:id/policies', route(idempotentWrite(
     (req) => policiesPath(param(req, 'id')),
     (userId, body, req) => publishPolicy(userId, param(req, 'id'), body))));
+  app.post('/restaurants/:id/replans', route(idempotentWrite(
+    (req) => replansPath(param(req, 'id')),
+    (userId, body, req) => previewReplan(userId, param(req, 'id'), body))));
+  app.post('/restaurants/:id/replans/:plan/apply', route(idempotentWrite(
+    (req) => applyPath(param(req, 'id'), param(req, 'plan')),
+    (userId, _body, req) => applyReplan(userId, param(req, 'id'), param(req, 'plan')))));
+  app.get('/restaurants/:id/closures', route((req) => {
+    const restaurant = findRestaurant(param(req, 'id'));
+    if (!restaurant) throw notFound('No such restaurant');
+    return listClosures(restaurant);
+  }));
   app.get('/availability', route(availability));
 
   app.post(PATH_RESERVATIONS, route(idempotentWrite(PATH_RESERVATIONS, createReservation)));
@@ -197,6 +209,9 @@ export function createApp(): express.Express {
   app.post(PATH_MOVES, route(idempotentWrite(PATH_MOVES, moveReservations)));
   app.post(PATH_SERIES, route(idempotentWrite(PATH_SERIES, adoptSeries)));
   app.get('/series/:id', route((req) => getSeries(optionalUserOf(req), param(req, 'id'))));
+  app.post('/series/:id/amend', route(idempotentWrite(
+    (req) => seriesAmendPath(param(req, 'id')),
+    (userId, body, req) => amendSeries(userId, param(req, 'id'), body))));
 
   app.use(route(() => {
     throw notFound('No such endpoint');

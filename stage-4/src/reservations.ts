@@ -34,9 +34,15 @@ const updateBookingStmt = db.prepare(
           start_ms = @start_ms, end_ms = @end_ms, revision = @revision, accepted_terms = @accepted_terms,
           exception = @exception
     WHERE id = @id`);
+// Applied closures (stage 4) hold their table like a confirmed booking does.
+const selectClosures = db.prepare('SELECT table_id, from_ms, to_ms FROM closures WHERE restaurant_id = ?');
+const selectOverlappingClosures = db.prepare(
+  'SELECT table_id, from_ms, to_ms FROM closures WHERE restaurant_id = ? AND from_ms < ? AND to_ms > ?');
+const closureHold = (c: { table_id: string; from_ms: number; to_ms: number }): Occupancy =>
+  ({ table_ids: [c.table_id], start_ms: c.from_ms, end_ms: c.to_ms });
 const updateCancelled = db.prepare("UPDATE reservations SET status = 'cancelled', revision = ? WHERE id = ?");
 const bumpSeriesStmt = db.prepare('UPDATE series SET revision = revision + 1 WHERE id = ?');
-const updateBooking = (row: ReservationRow) => updateBookingStmt.run(toDbRow(row));
+export const updateBooking = (row: ReservationRow) => updateBookingStmt.run(toDbRow(row));
 
 const readHold = (r: { table_ids: string }) => JSON.parse(r.table_ids) as string[];
 
@@ -63,9 +69,16 @@ export function view(r: ReservationRow) {
   };
 }
 
+/** Every hold on the restaurant's tables: confirmed bookings and applied closures. */
 export function occupancyOf(restaurantId: string): Occupancy[] {
-  return (selectConfirmedForRestaurant.all(restaurantId) as (Omit<Occupancy, 'table_ids'> & { table_ids: string })[])
+  const bookings = (selectConfirmedForRestaurant.all(restaurantId) as (Omit<Occupancy, 'table_ids'> & { table_ids: string })[])
     .map((r) => ({ ...r, table_ids: readHold(r) }));
+  return [...bookings, ...closuresOf(restaurantId)];
+}
+
+/** Applied closures as holds (stage 4). */
+export function closuresOf(restaurantId: string): Occupancy[] {
+  return (selectClosures.all(restaurantId) as { table_id: string; from_ms: number; to_ms: number }[]).map(closureHold);
 }
 
 /** The caller's reservation by reference; anyone else's (or no caller) is indistinguishable from none. */
@@ -133,15 +146,21 @@ export function resolveBooking(restaurant: Restaurant, tableIds: string[], local
   return { ...timing, table_ids: canonicalTables(restaurant, tableIds), party_size: partySize, accepted_terms: terms };
 }
 
-const tableUnavailable = () => conflict('table_unavailable', 'The table is taken for an overlapping time');
+export const tableUnavailable = () => conflict('table_unavailable', 'The table is taken for an overlapping time');
 
-/** 409 when `booking` overlaps a confirmed reservation other than those in `exclude`. */
+/**
+ * 409 when `booking` overlaps a confirmed reservation other than those in `exclude`, or an
+ * applied closure on one of its tables.
+ */
 export function assertFree(restaurantId: string, booking: Occupancy, exclude: ReadonlySet<string>): void {
   const clashes = selectOverlapping.all(restaurantId, booking.end_ms, booking.start_ms) as
     (Omit<Occupancy, 'table_ids'> & { id: string; table_ids: string })[];
   if (clashes.some((c) => !exclude.has(c.id) && overlaps(booking, { ...c, table_ids: readHold(c) }))) {
     throw tableUnavailable();
   }
+  const closed = selectOverlappingClosures.all(restaurantId, booking.end_ms, booking.start_ms) as
+    { table_id: string; from_ms: number; to_ms: number }[];
+  if (closed.some((c) => overlaps(booking, closureHold(c)))) throw tableUnavailable();
 }
 
 /** Stores a new confirmed reservation at revision 1 with its `created` history entry. */
@@ -230,7 +249,7 @@ function expectedRevision(body: JsonObject): number | undefined {
   return value;
 }
 
-interface Plan {
+export interface Plan {
   before: ReservationRow;
   after: ReservationRow;
   changed: boolean;
@@ -242,7 +261,7 @@ interface Plan {
  * of all resulting fields under the policy for the resulting date. Occupancy is not checked
  * here. A change to the current values is a no-op: it keeps terms, end time and revision.
  */
-function planAmendment(row: ReservationRow, body: JsonObject): Plan {
+export function planAmendment(row: ReservationRow, body: JsonObject, { markException = true } = {}): Plan {
   const expected = expectedRevision(body);
   if (expected !== undefined && expected !== row.revision) {
     throw conflict('stale_revision', `The reservation is at revision ${row.revision}`);
@@ -259,13 +278,14 @@ function planAmendment(row: ReservationRow, body: JsonObject): Plan {
   if (unchanged) return { before: row, after: row, changed: false };
   const booking = resolveBooking(restaurant, tableIds, local, partySize);
   const after: ReservationRow = {
-    ...row, ...booking, revision: row.revision + 1, exception: row.series_id !== null || row.exception,
+    ...row, ...booking, revision: row.revision + 1,
+    exception: row.exception || (markException && row.series_id !== null),
   };
   return { before: row, after, changed: true };
 }
 
 /** Writes a real amendment: the booking, its `changed` history entry. */
-function applyAmendment(plan: Plan): void {
+export function applyAmendment(plan: Plan): void {
   updateBooking(plan.after);
   record(plan.after, 'changed', amendmentChanges(plan.before, plan.after));
 }

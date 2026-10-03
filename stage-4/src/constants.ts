@@ -37,9 +37,10 @@ export const EXPORT_FORMAT_VERSION = 1;
  * stage 1 had one `table_id` per reservation and no `combinable`; stages 1 and 2 had no
  * policies, revisions, history or series.
  */
-export const STATE_SCHEMA = 'tablekeeper-store/3';
+export const STATE_SCHEMA = 'tablekeeper-store/4';
 export const STAGE1_STATE_SCHEMA = 'tablekeeper-store/1';
 export const STAGE2_STATE_SCHEMA = 'tablekeeper-store/2';
+export const STAGE3_STATE_SCHEMA = 'tablekeeper-store/3';
 
 /** Stage 2: a combination is a declared pair, never three or more tables. */
 export const MAX_TABLES_PER_BOOKING = 2;
@@ -70,3 +71,13 @@ export const SERIES_COUNT_MAX = 12;
 export const SERIES_INTERVAL_WEEKS_MIN = 1;
 export const SERIES_INTERVAL_WEEKS_MAX = 4;
 export const DAYS_PER_WEEK = 7;
+
+/** Stage 4 replans: inputs within these limits are always planned exhaustively. */
+export const PLANNING_MAX_TABLES = 6;
+export const PLANNING_MAX_PAIRS = 4;
+export const PLANNING_MAX_CONSIDERED = 6;
+/** Beyond the limits, a search space larger than this is refused with 422 planning_limit. */
+export const PLANNING_MAX_COMBINATIONS = 5_000_000;
+export const replansPath = (restaurantId: string) => `/restaurants/${restaurantId}/replans`;
+export const applyPath = (restaurantId: string, planId: string) => `/restaurants/${restaurantId}/replans/${planId}/apply`;
+export const seriesAmendPath = (seriesId: string) => `/series/${seriesId}/amend`;

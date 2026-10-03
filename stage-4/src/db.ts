@@ -81,6 +81,7 @@ db.exec(`
     changes        TEXT NOT NULL,
     revision       INTEGER NOT NULL,
     accepted_terms TEXT NOT NULL,
+    plan_id        TEXT,
     PRIMARY KEY (reservation_id, seq)
   );
   CREATE TABLE series (
@@ -90,6 +91,28 @@ db.exec(`
     interval_weeks INTEGER NOT NULL,
     revision       INTEGER NOT NULL
   );
+  CREATE TABLE plans (
+    id                  TEXT PRIMARY KEY,
+    restaurant_id       TEXT NOT NULL,
+    restaurant_revision INTEGER NOT NULL,
+    table_id            TEXT NOT NULL,
+    closure_from        TEXT NOT NULL,
+    closure_to          TEXT NOT NULL,
+    from_ms             INTEGER NOT NULL,
+    to_ms               INTEGER NOT NULL,
+    assignments         TEXT NOT NULL,
+    moved_count         INTEGER NOT NULL,
+    unused_seats        INTEGER NOT NULL,
+    applied             INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE TABLE closures (
+    restaurant_id TEXT NOT NULL,
+    table_id      TEXT NOT NULL,
+    from_ms       INTEGER NOT NULL,
+    to_ms         INTEGER NOT NULL,
+    plan_id       TEXT NOT NULL
+  );
+  CREATE INDEX closures_by_restaurant ON closures (restaurant_id, from_ms);
   CREATE TABLE idempotency (
     user_id      TEXT NOT NULL,
     path         TEXT NOT NULL,

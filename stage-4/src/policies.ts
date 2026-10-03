@@ -55,16 +55,22 @@ export function listPolicies(restaurantId: string): Outcome {
   return { status: 200, body: { policies: rows.map(policyView) } };
 }
 
+/** The restaurant, if the caller manages it: unknown 404, not a manager 403 (stage 3/4). */
+export function managedRestaurant(userId: string, restaurantId: string): Restaurant {
+  const restaurant = findRestaurant(restaurantId);
+  if (!restaurant) throw notFound('No such restaurant');
+  if (!restaurant.manager_user_ids.includes(userId)) {
+    throw new ApiError(403, 'forbidden', 'Only the restaurant\'s managers may do this');
+  }
+  return restaurant;
+}
+
 /**
  * Publishes a complete policy (runs inside the idempotency transaction): unknown restaurant
  * 404, non-manager 403, invalid policy 422; versions are allocated only on success.
  */
 export function publishPolicy(userId: string, restaurantId: string, body: JsonObject): Outcome {
-  const restaurant = findRestaurant(restaurantId);
-  if (!restaurant) throw notFound('No such restaurant');
-  if (!restaurant.manager_user_ids.includes(userId)) {
-    throw new ApiError(403, 'forbidden', 'Only the restaurant\'s managers may publish policies');
-  }
+  const restaurant = managedRestaurant(userId, restaurantId);
   const parsed = parsePolicyBody(body, restaurant);
   const version = (selectLatestVersion.get(restaurant.id) as { version: number }).version + 1;
   const policy: PolicyRow = { restaurant_id: restaurant.id, policy_version: version, ...parsed };

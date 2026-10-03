@@ -8,7 +8,7 @@ import { termsView } from './terms';
 import { formatUtcNow } from './time';
 
 const selectEntries = db.prepare(
-  'SELECT seq, at, event, changes, revision, accepted_terms FROM history WHERE reservation_id = ? ORDER BY seq');
+  'SELECT seq, at, event, changes, revision, accepted_terms, plan_id FROM history WHERE reservation_id = ? ORDER BY seq');
 const selectLastSeq = db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM history WHERE reservation_id = ?');
 
 /**
@@ -44,20 +44,22 @@ export function amendmentChanges(before: ReservationRow, after: ReservationRow):
   return changes;
 }
 
-/** Appends an entry for `row` as it is after the event. */
-export function record(row: ReservationRow, event: HistoryEvent, changes: Change[]): void {
+/** Appends an entry for `row` as it is after the event (`planId` for stage-4 reassignments). */
+export function record(row: ReservationRow, event: HistoryEvent, changes: Change[], planId: string | null = null): void {
   const seq = (selectLastSeq.get(row.id) as { seq: number }).seq + 1;
   const entry: HistoryRow = {
     reservation_id: row.id, seq, at: formatUtcNow(), event, changes,
-    revision: row.revision, accepted_terms: row.accepted_terms,
+    revision: row.revision, accepted_terms: row.accepted_terms, plan_id: planId,
   };
   insertHistory.run(historyDbRow(entry));
 }
 
 export function entriesOf(reservationId: string) {
-  return (selectEntries.all(reservationId) as { seq: number; at: string; event: string; changes: string; revision: number; accepted_terms: string }[])
+  type EntryRow = { seq: number; at: string; event: string; changes: string; revision: number; accepted_terms: string; plan_id: string | null };
+  return (selectEntries.all(reservationId) as EntryRow[])
     .map((e) => ({
       seq: e.seq, at: e.at, event: e.event, changes: JSON.parse(e.changes) as Change[],
+      ...(e.plan_id === null ? {} : { plan_id: e.plan_id }),
       revision: e.revision, accepted_terms: termsView(JSON.parse(e.accepted_terms)),
     }));
 }
