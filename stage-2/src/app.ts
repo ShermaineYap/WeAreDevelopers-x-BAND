@@ -1,5 +1,6 @@
 // HTTP wiring: routes, request decoding and the error envelope. Rules live in the modules
 // each route calls; this file only decides the order of request-level checks.
+import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { authenticate, login, signup } from './auth';
 import {
@@ -12,6 +13,7 @@ import {
   amendReservation, cancelReservation, createReservation, getReservation, listReservations,
   moveReservations, occupancyOf,
 } from './reservations';
+import { renderPage, SCREEN_ROUTES } from './pages';
 import { slotsOn } from './schedule';
 import { isObject, type JsonObject } from './shape';
 import { deserializeState, findRestaurant, listRestaurants, replaceState, serializeState, snapshotState } from './state';
@@ -121,6 +123,9 @@ function idempotentWrite(path: string, run: (userId: string, body: JsonObject) =
 
 const param = (req: Request, name: string) => String(req.params[name]);
 
+/** Browser assets (stylesheet and per-screen modules), shipped inside the image. */
+const ASSETS_DIR = path.join(__dirname, '..', 'public');
+
 export function createApp(): express.Express {
   const app = express();
   app.disable('x-powered-by');
@@ -129,6 +134,14 @@ export function createApp(): express.Express {
   const anyBody = (limit: string) => express.raw({ type: () => true, limit });
   app.use('/_test', anyBody(TEST_BODY_LIMIT));
   app.use(anyBody(API_BODY_LIMIT));
+
+  // Screen routes return HTML (stage 2); everything else stays JSON.
+  for (const [routePath, screen] of Object.entries(SCREEN_ROUTES)) {
+    app.get(routePath, (_req, res) => {
+      res.set('Cache-Control', 'no-store').type('text/html; charset=utf-8').send(renderPage(screen));
+    });
+  }
+  app.use('/assets', express.static(ASSETS_DIR, { fallthrough: true, maxAge: 0 }));
 
   app.get('/health', route(() => ok({ status: 'ok' })));
   app.post('/_test/reset', route(reset));
@@ -162,12 +175,18 @@ export function createApp(): express.Express {
     throw notFound('No such endpoint');
   }));
 
-  // Body-reading failures (oversized, aborted, bad encoding) still answer with the envelope.
+  // Framework-level failures still answer with the envelope: body-reading problems (oversized,
+  // aborted, bad encoding) carry a body-parser `type`; anything else 4xx is about the URL,
+  // e.g. a path segment with invalid percent-encoding.
   app.use((err: { status?: number; type?: string }, _req: Request, res: Response, _next: NextFunction) => {
     if (err.type === 'entity.too.large') {
       res.status(413).json(new ApiError(413, 'payload_too_large', 'The request body is too large').toBody());
+    } else if (err.status && err.status < 500) {
+      sendError(res, err.type
+        ? malformed('The request body could not be read')
+        : new ApiError(400, 'malformed_request', 'The request URL is not valid percent-encoding'));
     } else {
-      sendError(res, err.status && err.status < 500 ? malformed('The request body could not be read') : err);
+      sendError(res, err);
     }
   });
   return app;
