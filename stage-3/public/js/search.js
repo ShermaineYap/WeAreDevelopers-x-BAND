@@ -73,24 +73,30 @@ async function runSearch(query, { refresh = false } = {}) {
   const params = new URLSearchParams({
     restaurant_id: query.restaurantId, date: query.date, party_size: String(query.party), explain: 'true',
   });
+  const restaurantPath = `/restaurants/${encodeURIComponent(query.restaurantId)}`;
   let availability;
   let restaurant;
+  let policies;
   try {
-    [availability, restaurant] = await Promise.all([
+    [availability, restaurant, policies] = await Promise.all([
       api('GET', `/availability?${params}`),
-      api('GET', `/restaurants/${encodeURIComponent(query.restaurantId)}`),
+      api('GET', restaurantPath),
+      api('GET', `${restaurantPath}/policies`),
     ]);
   } catch {
     if (seq === state.seq) showSearchProblem('We could not reach the restaurant. Check your connection and try again.');
     return;
   }
   if (seq !== state.seq) return; // a newer search owns the screen
-  if (availability.status !== 200 || restaurant.status !== 200) {
-    showSearchProblem(errorMessage(availability.status !== 200 ? availability : restaurant,
-      'Those tables could not be loaded. Please try again.'));
+  const failed = [availability, restaurant, policies].find((r) => r.status !== 200);
+  if (failed) {
+    showSearchProblem(errorMessage(failed, 'Those tables could not be loaded. Please try again.'));
     return;
   }
-  state.shown = { query, restaurant: restaurant.body, availability: availability.body };
+  state.shown = {
+    query, restaurant: restaurant.body, availability: availability.body,
+    rules: rulesOn(restaurant.body, policies.body.policies, query.date),
+  };
   renderGrid();
 }
 
@@ -108,6 +114,24 @@ form.addEventListener('submit', (event) => {
   runSearch(query);
 });
 
+/**
+ * The opening hours and capacities that apply on `date`: the published policy with the
+ * greatest effective date not after it (ties: greatest version), else the restaurant's own
+ * configuration. Used only to describe the grid (closed day, seat counts); availability itself
+ * always comes from the server.
+ */
+function rulesOn(restaurant, policies, date) {
+  const applicable = policies
+    .filter((p) => p.effective_from <= date)
+    .sort((a, b) => (a.effective_from === b.effective_from
+      ? b.policy_version - a.policy_version : b.effective_from.localeCompare(a.effective_from)))[0];
+  if (applicable) return { opening_hours: applicable.opening_hours, capacities: applicable.capacities };
+  return {
+    opening_hours: restaurant.opening_hours,
+    capacities: Object.fromEntries(restaurant.tables.map((t) => [t.id, t.capacity])),
+  };
+}
+
 /** Re-reads availability for the latest query after a write, keeping the form open. */
 function refreshGrid() {
   if (state.query) runSearch(state.query, { refresh: true });
@@ -117,7 +141,7 @@ function refreshGrid() {
 
 const CAUSE_TEXT = { available: 'Available', booked: 'Booked', small: 'Too small' };
 
-/** A cell; `capacity` is shown when the server reported it (available seatings). */
+/** One seating cell: its tables, seats under the date's rules, and why it is (un)available. */
 function cell({ restaurant, tableIds, startsAtLocal, capacity, cause }) {
   const time = startsAtLocal.slice(11, 16);
   const name = seatingName(restaurant, tableIds);
@@ -132,21 +156,21 @@ function cell({ restaurant, tableIds, startsAtLocal, capacity, cause }) {
     'data-available': String(available),
     'aria-disabled': available ? false : 'true',
     'aria-pressed': available ? String(selected) : false,
-    'aria-label': `${name}, ${combined ? 'tables together, ' : ''}${capacity ? `seats ${capacity}, ` : ''}${time}: ${CAUSE_TEXT[cause].toLowerCase()}`,
+    'aria-label': `${name}, ${combined ? 'tables together, ' : ''}seats ${capacity}, ${time}: ${CAUSE_TEXT[cause].toLowerCase()}`,
     onclick: () => { if (available) choose(tableIds, startsAtLocal); },
   },
   el('span', { class: 'cell__name' }, name),
-  capacity ? el('span', { class: 'cell__meta' }, `${combined ? 'Together · ' : ''}Seats ${capacity}`) : null,
+  el('span', { class: 'cell__meta' }, `${combined ? 'Together · ' : ''}Seats ${capacity}`),
   el('span', { class: 'cell__state' }, selected ? 'Selected' : CAUSE_TEXT[cause]));
 }
 
 function renderGrid() {
-  const { query, restaurant, availability } = state.shown;
+  const { query, restaurant, availability, rules } = state.shown;
   results.removeAttribute('aria-busy');
   const day = formatDay(query.date);
   if (availability.slots.length === 0) {
     const weekday = WEEKDAYS[new Date(`${query.date}T12:00:00Z`).getUTCDay()];
-    const open = restaurant.opening_hours.some((h) => h.weekday === weekday);
+    const open = rules.opening_hours.some((h) => h.weekday === weekday);
     results.replaceChildren(el('div', { class: 'empty-state empty-state--closed', 'data-testid': 'no-slots' },
       el('p', { class: 'empty-state__title' }, open ? `No bookable times on ${day}` : `Closed on ${day}`),
       el('p', {}, open
@@ -158,11 +182,10 @@ function renderGrid() {
   const rows = availability.slots.map((slot) => {
     const optionFor = (ids) => slot.available_options.find((o) => o.table_ids.join('+') === ids.join('+'));
     const singles = restaurant.tables.map((table) => {
-      const option = optionFor([table.id]);
       const reason = (slot.explain || []).find((e) => e.table_id === table.id);
       const tooSmall = reason ? !reason.rules[0].holds : false;
       const cause = slot.available_table_ids.includes(table.id) ? 'available' : tooSmall ? 'small' : 'booked';
-      return cell({ restaurant, tableIds: [table.id], startsAtLocal: slot.starts_at_local, capacity: option && option.capacity, cause });
+      return cell({ restaurant, tableIds: [table.id], startsAtLocal: slot.starts_at_local, capacity: rules.capacities[table.id], cause });
     });
     // Combined seatings appear only when the declared pair is free for this party.
     const pairs = (restaurant.combinable || [])

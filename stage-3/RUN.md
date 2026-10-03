@@ -114,7 +114,10 @@ BASE_URL=http://localhost:8080 node --test --test-concurrency=1 stage-3/tests/ac
 - Bookings seeded by a fixture or imported from stage-1/stage-2 exports get revision 1, policy-0
   terms and a synthesised `created` (and `cancelled`) history entry at their creation time.
 - UI: the grid asks for `explain=true`, so a table that cannot fit the party under the date's
-  policy is labelled "Too small" and seat counts come from the server's options.
+  policy is labelled "Too small". Seat counts and the closed-day message come from the policy
+  that applies to the searched date (selected from the public `GET /restaurants/{id}/policies`
+  with the server's rule: greatest `effective_from` not after the date, ties by greatest
+  version; the fixture before any). Availability itself always comes from the server.
 - UI: the session token is kept in `localStorage`; a booking's retry identity (body and
   Idempotency-Key) is kept in the page, so an unchanged resubmit or a retry after a lost
   response reuses the key, and any change to the form uses a new one. Only the latest search
